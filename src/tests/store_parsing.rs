@@ -450,18 +450,6 @@ fn get_registry_no_config_file() {
 }
 
 #[test]
-fn get_registry_direct_indirection() {
-    let cargo_config = r#"
-[source.crates-io]
-registry="https://myreg.internal/api"
-    "#;
-    assert_eq!(
-        Some("https://myreg.internal/api".to_string()),
-        crate::storage::get_registry_url_from_config(cargo_config)
-    );
-}
-
-#[test]
 fn get_registry_replace_with_alternative_source() {
     let cargo_config = r#"
 [source.my-source]

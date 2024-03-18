@@ -3046,31 +3046,32 @@ fn store_publisher_cache(publisher_cache: CratesCache) -> Result<String, StoreJs
     store_json(publisher_cache)
 }
 
-fn get_registry_for(source: &str, table: &toml::value::Table) -> Option<String> {
-    if let Some(toml::Value::Table(t)) = table.get(source) {
-        if let Some(toml::Value::String(redirect)) = t.get("replace-with") {
-            return get_registry_for(redirect, table);
-        }
-        if let Some(toml::Value::String(registry)) = t.get("registry") {
-            return Some(registry.into());
-        }
-    }
-    None
-}
-
 pub fn get_registry_url_from_config(cargo_config: &str) -> Option<String> {
-    cargo_config
+    if let Some(table) = cargo_config
         .parse::<toml::Value>()
         .ok()
         .as_ref()
         .and_then(|v| v.as_table())
         .and_then(|t| t.get("source"))
         .and_then(|s| s.as_table())
-        .and_then(|sources| get_registry_for("crates-io", sources))
+    {
+        table
+            .get("crates-io")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("replace-with"))
+            .and_then(|s| s.as_str())
+            .and_then(|s| table.get(s))
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("registry"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+    } else {
+        None
+    }
 }
 
 pub fn read_cargo_config_from_dir(dir: &Path) -> Option<String> {
-    let mut path : PathBuf = dir.into();
+    let mut path: PathBuf = dir.into();
     path.push("config.toml");
     if let Ok(config) = fs::read_to_string(path) {
         return Some(config);
@@ -3087,9 +3088,11 @@ pub fn get_registry_url() -> String {
     // https://doc.rust-lang.org/cargo/reference/config.html?highlight=replace-with#hierarchical-structure
     if let Ok(mut dir) = env::current_dir() {
         loop {
+            dir.push(".cargo");
             if let Some(url) = get_registry_url_from_dir(&dir) {
                 return url;
             }
+            dir.pop();
             if !dir.pop() {
                 break;
             }
