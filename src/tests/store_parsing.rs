@@ -439,3 +439,39 @@ description = "fuzzed"
     let acquire_errors = get_valid_store(config, EMPTY_AUDITS, imports);
     insta::assert_snapshot!(acquire_errors);
 }
+
+#[test]
+fn get_registry_no_config_file() {
+    let cargo_config = "";
+    assert_eq!(
+        None,
+        crate::storage::get_registry_url_from_config(cargo_config)
+    );
+}
+
+#[test]
+fn get_registry_direct_indirection() {
+    let cargo_config = r#"
+[source.crates-io]
+registry="https://myreg.internal/api"
+    "#;
+    assert_eq!(
+        Some("https://myreg.internal/api".to_string()),
+        crate::storage::get_registry_url_from_config(cargo_config)
+    );
+}
+
+#[test]
+fn get_registry_replace_with_alternative_source() {
+    let cargo_config = r#"
+[source.my-source]
+registry="https://myreg.internal/api"
+
+[source.crates-io]
+replace-with="my-source"
+    "#;
+    assert_eq!(
+        Some("https://myreg.internal/api".to_string()),
+        crate::storage::get_registry_url_from_config(cargo_config)
+    );
+}

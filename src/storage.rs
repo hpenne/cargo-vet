@@ -1,4 +1,5 @@
 use std::{
+    env,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Seek, Write},
@@ -16,6 +17,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use similar::{udiff::unified_diff, Algorithm};
 use tar::Archive;
+use toml;
 use tracing::{error, info, log::warn, trace};
 
 use crate::{
@@ -1671,6 +1673,8 @@ pub struct Cache {
     command_history_path: Option<PathBuf>,
     /// Path to the CratesCache (for when we want to save it back)
     publisher_cache_path: Option<PathBuf>,
+    /// The URL to the crates.io registry ("https://crates.io/api/v1/crates" by default)
+    registry_url: String,
     /// Semaphore preventing exceeding the maximum number of concurrent diffs.
     diff_semaphore: tokio::sync::Semaphore,
     /// The time to use as `now` when considering cache expiry.
@@ -1729,6 +1733,7 @@ impl Cache {
                 diff_cache_path: None,
                 command_history_path: None,
                 publisher_cache_path: None,
+                registry_url: get_registry_url(),
                 diff_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFFS),
                 now: cfg.now,
                 state: Mutex::new(CacheState {
@@ -1795,6 +1800,7 @@ impl Cache {
             diff_cache_path: Some(diff_cache_path),
             command_history_path: Some(command_history_path),
             publisher_cache_path: Some(publisher_cache_path),
+            registry_url: get_registry_url(),
             diff_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFFS),
             now: cfg.now,
             state: Mutex::new(CacheState {
@@ -1923,7 +1929,7 @@ impl Cache {
 
                         // We don't have it, so download it
                         let url =
-                            format!("https://crates.io/api/v1/crates/{package}/{version}/download");
+                            format!("{}/{package}/{version}/download", self.registry_url);
                         let url = Url::parse(&url).map_err(|error| FetchError::InvalidUrl {
                             url: url.clone(),
                             error,
@@ -2603,7 +2609,8 @@ impl<'a> UpdateCratesCache<'a> {
         network: &Network,
     ) -> Result<std::sync::MutexGuard<'a, CacheState>, CrateInfoError> {
         let url = Url::parse(&format!(
-            "https://crates.io/api/v1/crates/{}",
+            "{}/{}",
+            self.cache.registry_url,
             self.crate_name
         ))
         .expect("invalid crate name");
@@ -3042,4 +3049,62 @@ fn store_command_history(command_history: CommandHistory) -> Result<String, Stor
 }
 fn store_publisher_cache(publisher_cache: CratesCache) -> Result<String, StoreJsonError> {
     store_json(publisher_cache)
+}
+
+fn get_registry_for(source: &str, table: &toml::value::Table) -> Option<String> {
+    if let Some(toml::Value::Table(t)) = table.get(source) {
+        if let Some(toml::Value::String(redirect)) = t.get("replace-with") {
+            return get_registry_for(redirect, table);
+        }
+        if let Some(toml::Value::String(registry)) = t.get("registry") {
+            return Some(registry.into());
+        }
+    }
+    None
+}
+
+pub fn get_registry_url_from_config(cargo_config: &str) -> Option<String> {
+    cargo_config
+        .parse::<toml::Value>()
+        .ok()
+        .as_ref()
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("source"))
+        .and_then(|s| s.as_table())
+        .and_then(|sources| get_registry_for("crates-io", sources))
+}
+
+pub fn read_cargo_config_from_dir(dir: &PathBuf) -> Option<String> {
+    let mut path = dir.clone();
+    path.push("config.toml");
+    if let Ok(config) = fs::read_to_string(path) {
+        return Some(config);
+    }
+    None
+}
+
+fn get_registry_url_from_dir(dir: &PathBuf) -> Option<String> {
+    read_cargo_config_from_dir(&dir).and_then(|config| get_registry_url_from_config(&config))
+}
+
+pub fn get_registry_url() -> String {
+    // Check all locations as described here:
+    // https://doc.rust-lang.org/cargo/reference/config.html?highlight=replace-with#hierarchical-structure
+    if let Ok(mut dir) = env::current_dir() {
+        loop {
+            if let Some(url) = get_registry_url_from_dir(&dir) {
+                return url;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    if let Some(url) = home::cargo_home()
+        .ok()
+        .and_then(|dir| get_registry_url_from_dir(&dir))
+    {
+        return url;
+    }
+    "https://crates.io/api/v1/crates".into()
 }
