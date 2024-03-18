@@ -1673,7 +1673,7 @@ pub struct Cache {
     command_history_path: Option<PathBuf>,
     /// Path to the CratesCache (for when we want to save it back)
     publisher_cache_path: Option<PathBuf>,
-    /// The URL to the crates.io registry ("https://crates.io/api/v1/crates" by default)
+    /// The URL to the crates.io registry (<https://crates.io/api/v1/crates> by default)
     registry_url: String,
     /// Semaphore preventing exceeding the maximum number of concurrent diffs.
     diff_semaphore: tokio::sync::Semaphore,
@@ -1928,8 +1928,7 @@ impl Cache {
                         })?;
 
                         // We don't have it, so download it
-                        let url =
-                            format!("{}/{package}/{version}/download", self.registry_url);
+                        let url = format!("{}/{package}/{version}/download", self.registry_url);
                         let url = Url::parse(&url).map_err(|error| FetchError::InvalidUrl {
                             url: url.clone(),
                             error,
@@ -2608,12 +2607,8 @@ impl<'a> UpdateCratesCache<'a> {
         &self,
         network: &Network,
     ) -> Result<std::sync::MutexGuard<'a, CacheState>, CrateInfoError> {
-        let url = Url::parse(&format!(
-            "{}/{}",
-            self.cache.registry_url,
-            self.crate_name
-        ))
-        .expect("invalid crate name");
+        let url = Url::parse(&format!("{}/{}", self.cache.registry_url, self.crate_name))
+            .expect("invalid crate name");
 
         let response = self.try_download(network, url).await?;
         let result = load_json::<CratesAPICrate>(&response[..])?;
@@ -3074,8 +3069,8 @@ pub fn get_registry_url_from_config(cargo_config: &str) -> Option<String> {
         .and_then(|sources| get_registry_for("crates-io", sources))
 }
 
-pub fn read_cargo_config_from_dir(dir: &PathBuf) -> Option<String> {
-    let mut path = dir.clone();
+pub fn read_cargo_config_from_dir(dir: &Path) -> Option<String> {
+    let mut path : PathBuf = dir.into();
     path.push("config.toml");
     if let Ok(config) = fs::read_to_string(path) {
         return Some(config);
@@ -3083,8 +3078,8 @@ pub fn read_cargo_config_from_dir(dir: &PathBuf) -> Option<String> {
     None
 }
 
-fn get_registry_url_from_dir(dir: &PathBuf) -> Option<String> {
-    read_cargo_config_from_dir(&dir).and_then(|config| get_registry_url_from_config(&config))
+fn get_registry_url_from_dir(dir: &Path) -> Option<String> {
+    read_cargo_config_from_dir(dir).and_then(|config| get_registry_url_from_config(&config))
 }
 
 pub fn get_registry_url() -> String {
