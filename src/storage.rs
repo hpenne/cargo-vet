@@ -15,6 +15,7 @@ use futures_util::future::{join_all, try_join_all};
 use miette::SourceOffset;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use similar::{udiff::unified_diff, Algorithm};
 use tar::Archive;
 use toml;
@@ -256,7 +257,7 @@ impl Store {
     ) -> Result<Self, StoreAcquireError> {
         let mut this = Self::acquire_offline(cfg)?;
         if let Some(network) = network {
-            let cache = Cache::acquire(cfg).map_err(Box::new)?;
+            let cache = Cache::acquire(cfg, Some(&network)).map_err(Box::new)?;
             tokio::runtime::Handle::current().block_on(this.go_online(
                 cfg,
                 network,
@@ -351,7 +352,7 @@ impl Store {
         ))?;
         let mut live_imports =
             process_imported_audits(fetched_audits, &imports, allow_criteria_changes)?;
-        let cache = Cache::acquire(cfg).map_err(Box::new)?;
+        let cache = Cache::acquire(cfg, None).map_err(Box::new)?;
         tokio::runtime::Handle::current()
             .block_on(import_unpublished_entries(
                 &cfg.metadata,
@@ -753,7 +754,7 @@ impl Store {
         package: PackageStr<'_>,
     ) -> Result<&[CratesPublisher], CertifyError> {
         if let (Some(network), Some(live_imports)) = (network, self.live_imports.as_mut()) {
-            let cache = Cache::acquire(cfg)?;
+            let cache = Cache::acquire(cfg, Some(&network))?;
             tokio::runtime::Handle::current().block_on(import_publisher_versions(
                 &cfg.metadata,
                 network,
@@ -1674,7 +1675,7 @@ pub struct Cache {
     /// Path to the CratesCache (for when we want to save it back)
     publisher_cache_path: Option<PathBuf>,
     /// The URL to the crates.io registry (<https://crates.io/api/v1/crates> by default)
-    registry_url: String,
+    registry_urls: RegistryUrls,
     /// Semaphore preventing exceeding the maximum number of concurrent diffs.
     diff_semaphore: tokio::sync::Semaphore,
     /// The time to use as `now` when considering cache expiry.
@@ -1723,7 +1724,10 @@ impl Drop for Cache {
 
 impl Cache {
     /// Acquire the cache
-    pub fn acquire(cfg: &PartialConfig) -> Result<Self, CacheAcquireError> {
+    pub fn acquire(
+        cfg: &PartialConfig,
+        network: Option<&Network>,
+    ) -> Result<Self, CacheAcquireError> {
         #[cfg(test)]
         if cfg.mock_cache {
             // We're in unit tests, everything should be mocked and not touch real caches
@@ -1733,7 +1737,7 @@ impl Cache {
                 diff_cache_path: None,
                 command_history_path: None,
                 publisher_cache_path: None,
-                registry_url: get_registry_url(),
+                registry_urls: get_registry_urls(None),
                 diff_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFFS),
                 now: cfg.now,
                 state: Mutex::new(CacheState {
@@ -1800,7 +1804,7 @@ impl Cache {
             diff_cache_path: Some(diff_cache_path),
             command_history_path: Some(command_history_path),
             publisher_cache_path: Some(publisher_cache_path),
-            registry_url: get_registry_url(),
+            registry_urls: get_registry_urls(network),
             diff_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFFS),
             now: cfg.now,
             state: Mutex::new(CacheState {
@@ -1928,7 +1932,8 @@ impl Cache {
                         })?;
 
                         // We don't have it, so download it
-                        let url = format!("{}/{package}/{version}/download", self.registry_url);
+                        let url =
+                            format!("{}/{package}/{version}/download", self.registry_urls.api);
                         let url = Url::parse(&url).map_err(|error| FetchError::InvalidUrl {
                             url: url.clone(),
                             error,
@@ -2607,8 +2612,11 @@ impl<'a> UpdateCratesCache<'a> {
         &self,
         network: &Network,
     ) -> Result<std::sync::MutexGuard<'a, CacheState>, CrateInfoError> {
-        let url = Url::parse(&format!("{}/{}", self.cache.registry_url, self.crate_name))
-            .expect("invalid crate name");
+        let url = Url::parse(&format!(
+            "{}/{}",
+            self.cache.registry_urls.api, self.crate_name
+        ))
+        .expect("invalid crate name");
 
         let response = self.try_download(network, url).await?;
         let result = load_json::<CratesAPICrate>(&response[..])?;
@@ -2669,7 +2677,7 @@ impl<'a> UpdateCratesCache<'a> {
     ) -> Result<std::sync::MutexGuard<'a, CacheState>, CrateInfoError> {
         // Crate names can only be a subset of ascii (valid rust identifier characters and `-`), so
         // using `len()` and indexing will result in valid counts/characters.
-        let mut url = String::from("https://index.crates.io/");
+        let mut url = self.cache.registry_urls.index.clone();
         let name = self.crate_name;
         use std::fmt::Write;
         match name.len() {
@@ -3071,10 +3079,13 @@ pub fn get_registry_url_from_config(cargo_config: &str) -> Option<String> {
 }
 
 pub fn read_cargo_config_from_dir(dir: &Path) -> Option<String> {
-    let mut path: PathBuf = dir.into();
-    path.push("config.toml");
-    if let Ok(config) = fs::read_to_string(path) {
-        return Some(config);
+    // The cargo doc says we should try the file name without the extension first:
+    for file_name in ["config", "config.toml"] {
+        let mut path: PathBuf = dir.into();
+        path.push(file_name);
+        if let Ok(config) = fs::read_to_string(path) {
+            return Some(config);
+        }
     }
     None
 }
@@ -3083,14 +3094,14 @@ fn get_registry_url_from_dir(dir: &Path) -> Option<String> {
     read_cargo_config_from_dir(dir).and_then(|config| get_registry_url_from_config(&config))
 }
 
-pub fn get_registry_url() -> String {
-    // Check all locations as described here:
+fn get_registry_index_url() -> Option<String> {
+    // Check all locations from the current dir up to the root, as described here:
     // https://doc.rust-lang.org/cargo/reference/config.html?highlight=replace-with#hierarchical-structure
     if let Ok(mut dir) = env::current_dir() {
         loop {
             dir.push(".cargo");
             if let Some(url) = get_registry_url_from_dir(&dir) {
-                return url;
+                return Some(url);
             }
             dir.pop();
             if !dir.pop() {
@@ -3098,11 +3109,52 @@ pub fn get_registry_url() -> String {
             }
         }
     }
+    // Try the user's cargo home:
     if let Some(url) = home::cargo_home()
         .ok()
         .and_then(|dir| get_registry_url_from_dir(&dir))
     {
-        return url;
+        return Some(url);
     }
-    "https://crates.io/api/v1/crates".into()
+    None
+}
+
+pub struct RegistryUrls {
+    // URL for the crate index
+    index: String,
+    // URL for the web API
+    api: String,
+}
+
+pub fn get_registry_urls(network: Option<&Network>) -> RegistryUrls {
+    // Read the config.json file from the registry index,
+    // then parse that to find the URL for the web API
+    if let Some(network) = network {
+        if let Some(index) = get_registry_index_url() {
+            let config_url = index.clone() + "/config.json";
+            if let Ok(url) = Url::parse(&config_url) {
+                // Download the config.json:
+                if let Some(config) = tokio::runtime::Handle::current()
+                    .block_on(network.download(url))
+                    .ok()
+                    .and_then(|c| String::from_utf8(c).ok())
+                {
+                    // Parse the JSON and use the "api" field as the URL for the web API:
+                    if let Some(api) = serde_json::from_str(&config)
+                        .ok()
+                        .map(|v: Value| v["api"].clone())
+                        .map(|v| v.to_string())
+                    {
+                        return RegistryUrls { index, api };
+                    }
+                }
+            }
+        }
+    }
+
+    // Defaults:
+    RegistryUrls {
+        index: "https://index.crates.io".into(),
+        api: "https://crates.io/api/v1/crates".into(),
+    }
 }

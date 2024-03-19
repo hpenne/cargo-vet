@@ -1687,7 +1687,7 @@ impl<'a> ResolveReport<'a> {
             return Ok(None);
         };
 
-        let cache = Cache::acquire(cfg)?;
+        let cache = Cache::acquire(cfg, network)?;
 
         let warnings = RefCell::new(Vec::new());
 

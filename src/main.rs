@@ -561,7 +561,7 @@ fn cmd_inspect(
     let fetched = {
         let network = Network::acquire(cfg);
         let store = Store::acquire(cfg, network.as_ref(), false)?;
-        let cache = Cache::acquire(cfg)?;
+        let cache = Cache::acquire(cfg, network.as_ref())?;
 
         // Record this command for magic in `vet certify`
         cache.set_last_fetch(FetchCommand::Inspect {
@@ -663,7 +663,7 @@ fn cmd_certify(
     let mut store = Store::acquire(cfg, network.as_ref(), false)?;
 
     // Grab the last fetch and immediately drop the cache
-    let last_fetch = Cache::acquire(cfg)?.get_last_fetch();
+    let last_fetch = Cache::acquire(cfg, network.as_ref())?.get_last_fetch();
 
     do_cmd_certify(out, cfg, sub_args, &mut store, network.as_ref(), last_fetch)?;
 
@@ -1303,7 +1303,7 @@ fn cmd_import(
         .url = import_urls;
 
     // After adding the new entry, go online, this will fetch the new import.
-    let cache = Cache::acquire(cfg)?;
+    let cache = Cache::acquire(cfg, Some(&network))?;
     tokio::runtime::Handle::current().block_on(store.go_online(cfg, &network, &cache, false))?;
 
     // Update the store state, pruning unnecessary exemptions, audits, and imports.
@@ -1844,7 +1844,7 @@ fn do_cmd_renew(out: &Arc<dyn Out>, cfg: &Config, store: &mut Store, sub_args: &
 
     // We need the cache to map user ids to user names, though we can work around it if there is an
     // error.
-    let cache = Cache::acquire(cfg).ok();
+    let cache = Cache::acquire(cfg, None).ok();
 
     let new_end_date = cfg.today() + chrono::Months::new(12);
 
@@ -1915,7 +1915,7 @@ async fn fix_audit_as(
 ) -> Result<(), CacheAcquireError> {
     let _spinner = indeterminate_spinner("Fetching", "crate metadata");
 
-    let mut cache = Cache::acquire(cfg)?;
+    let mut cache = Cache::acquire(cfg, network)?;
 
     let third_party_packages = foreign_packages_strict(&cfg.metadata, &store.config)
         .map(|p| &p.name)
@@ -2043,7 +2043,7 @@ fn cmd_diff(out: &Arc<dyn Out>, cfg: &Config, sub_args: &DiffArgs) -> Result<(),
     let to_compare = {
         let network = Network::acquire(cfg);
         let store = Store::acquire(cfg, network.as_ref(), false)?;
-        let cache = Cache::acquire(cfg)?;
+        let cache = Cache::acquire(cfg, network.as_ref())?;
 
         // Record this command for magic in `vet certify`
         cache.set_last_fetch(FetchCommand::Diff {
@@ -2164,7 +2164,7 @@ fn cmd_check(
 
     if !cfg.cli.locked {
         // Check if any of our first-parties are in the crates.io registry
-        let mut cache = Cache::acquire(cfg).into_diagnostic()?;
+        let mut cache = Cache::acquire(cfg, network.as_ref()).into_diagnostic()?;
         // Check crate policies prior to audit_as_crates_io because the suggestions of
         // check_audit_as_crates_io will rely on the correct structure of crate policies.
         check_crate_policies(cfg, &store)?;
@@ -2719,7 +2719,7 @@ fn cmd_gc(
     cfg: &PartialConfig,
     sub_args: &GcArgs,
 ) -> Result<(), miette::Report> {
-    let cache = Cache::acquire(cfg)?;
+    let cache = Cache::acquire(cfg, None)?;
 
     if sub_args.clean {
         writeln!(
