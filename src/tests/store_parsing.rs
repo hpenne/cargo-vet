@@ -463,3 +463,18 @@ replace-with="my-source"
         crate::storage::get_registry_url_from_config(cargo_config)
     );
 }
+
+#[test]
+fn get_registry_from_recursive_setup() {
+    let cargo_config = r#"
+[source.my-source]
+replace-with="my-source"
+
+[source.crates-io]
+replace-with="my-source"
+    "#;
+    assert_eq!(
+        None,
+        crate::storage::get_registry_url_from_config(cargo_config)
+    );
+}

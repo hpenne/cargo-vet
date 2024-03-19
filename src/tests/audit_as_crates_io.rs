@@ -32,7 +32,7 @@ fn build_registry(network: &mut Network, extra_packages: &[&str]) {
 }
 
 fn get_audit_as_crates_io(cfg: &Config, store: &Store, add_packages_to_index: bool) -> String {
-    let mut cache = crate::storage::Cache::acquire(cfg).unwrap();
+    let mut cache = crate::storage::Cache::acquire(cfg, None).unwrap();
     let mut network = crate::network::Network::new_mock();
     build_registry(
         &mut network,
@@ -55,7 +55,7 @@ fn get_audit_as_crates_io(cfg: &Config, store: &Store, add_packages_to_index: bo
 }
 
 fn get_audit_as_crates_io_json(cfg: &Config, store: &Store) -> String {
-    let mut cache = crate::storage::Cache::acquire(cfg).unwrap();
+    let mut cache = crate::storage::Cache::acquire(cfg, None).unwrap();
     let mut network = crate::network::Network::new_mock();
     build_registry(&mut network, &[]);
     let res = tokio::runtime::Handle::current().block_on(crate::check_audit_as_crates_io(

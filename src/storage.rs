@@ -3054,28 +3054,31 @@ fn store_publisher_cache(publisher_cache: CratesCache) -> Result<String, StoreJs
     store_json(publisher_cache)
 }
 
+fn get_registry_for(source: &str, table: &toml::value::Table, remaining_depth: usize) -> Option<String> {
+    if remaining_depth == 0 {
+        // To prevent infinite recursion in case of bad setups
+        return None;
+    }
+    if let Some(toml::Value::Table(t)) = table.get(source) {
+        if let Some(toml::Value::String(redirect)) = t.get("replace-with") {
+            return get_registry_for(redirect, table, remaining_depth - 1);
+        }
+        if let Some(toml::Value::String(registry)) = t.get("registry") {
+            return Some(registry.into());
+        }
+    }
+    None
+}
+
 pub fn get_registry_url_from_config(cargo_config: &str) -> Option<String> {
-    if let Some(table) = cargo_config
+    cargo_config
         .parse::<toml::Value>()
         .ok()
         .as_ref()
         .and_then(|v| v.as_table())
         .and_then(|t| t.get("source"))
         .and_then(|s| s.as_table())
-    {
-        table
-            .get("crates-io")
-            .and_then(|v| v.as_table())
-            .and_then(|t| t.get("replace-with"))
-            .and_then(|s| s.as_str())
-            .and_then(|s| table.get(s))
-            .and_then(|v| v.as_table())
-            .and_then(|t| t.get("registry"))
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string())
-    } else {
-        None
-    }
+        .and_then(|sources| get_registry_for("crates-io", sources, 5))
 }
 
 pub fn read_cargo_config_from_dir(dir: &Path) -> Option<String> {
