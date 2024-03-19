@@ -3072,7 +3072,7 @@ pub fn get_registry_url_from_config(cargo_config: &str) -> Option<String> {
 
 pub fn read_cargo_config_from_dir(dir: &Path) -> Option<String> {
     let mut path: PathBuf = dir.into();
-    path.push("config.toml");
+    path.push("config");
     if let Ok(config) = fs::read_to_string(path) {
         return Some(config);
     }
