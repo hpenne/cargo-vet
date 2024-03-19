@@ -2681,10 +2681,10 @@ impl<'a> UpdateCratesCache<'a> {
         let name = self.crate_name;
         use std::fmt::Write;
         match name.len() {
-            1 => write!(url, "1/{name}"),
-            2 => write!(url, "2/{name}"),
-            3 => write!(url, "3/{}/{name}", &name[0..1]),
-            _ => write!(url, "{}/{}/{name}", &name[0..2], &name[2..4]),
+            1 => write!(url, "/1/{name}"),
+            2 => write!(url, "/2/{name}"),
+            3 => write!(url, "/3/{}/{name}", &name[0..1]),
+            _ => write!(url, "/{}/{}/{name}", &name[0..2], &name[2..4]),
         }
         .expect("writing to a String should not fail");
         // Crate index always use lowercases, but crate name may contain uppercase characters.
