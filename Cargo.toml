@@ -52,7 +52,7 @@ toml = "0.5.9"
 open = "3.0.2"
 
 [features]
-native-certs = ["reqwest/rustls-native-certs"]
+native-certs = ["reqwest/rustls-tls-native-roots"]
 
 [target.'cfg(windows)'.dependencies.winapi]
 version = "0.3"
