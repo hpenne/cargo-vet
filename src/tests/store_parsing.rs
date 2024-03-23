@@ -1,3 +1,5 @@
+use crate::errors::RedirectError;
+
 const EMPTY_CONFIG: &str = r#"
 # cargo-vet config file
 
@@ -443,10 +445,10 @@ description = "fuzzed"
 #[test]
 fn get_registry_no_config_file() {
     let cargo_config = "";
-    assert_eq!(
-        None,
-        crate::storage::get_registry_url_from_config(cargo_config)
-    );
+    assert!(matches!(
+        crate::storage::get_registry_url_from_config(cargo_config),
+        Ok(None)
+    ));
 }
 
 #[test]
@@ -458,10 +460,9 @@ registry="https://myreg.internal/api"
 [source.crates-io]
 replace-with="my-source"
     "#;
-    assert_eq!(
-        Some("https://myreg.internal/api".to_string()),
-        crate::storage::get_registry_url_from_config(cargo_config)
-    );
+    let result = crate::storage::get_registry_url_from_config(cargo_config);
+    assert!(matches!(result.as_ref(), Ok(Some(_))));
+    assert_eq!("https://myreg.internal/api", result.unwrap().unwrap());
 }
 
 #[test]
@@ -473,8 +474,8 @@ replace-with="my-source"
 [source.crates-io]
 replace-with="my-source"
     "#;
-    assert_eq!(
-        None,
-        crate::storage::get_registry_url_from_config(cargo_config)
-    );
+    assert!(matches!(
+        crate::storage::get_registry_url_from_config(cargo_config),
+        Err(RedirectError::RecursiveConfig)
+    ));
 }

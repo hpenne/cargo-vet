@@ -531,6 +531,12 @@ pub enum CacheAcquireError {
         #[source]
         FlockError,
     ),
+    #[error("Couldn't resolve registry redirect setup")]
+    RedirectError(
+        #[from]
+        #[source]
+        RedirectError,
+    ),
 }
 
 #[derive(Debug, Error, Diagnostic)]
@@ -1026,3 +1032,17 @@ pub enum LoadJsonError {
 pub type StoreJsonError = serde_json::Error;
 
 pub type StoreTomlError = toml_edit::ser::Error;
+
+//////////////////////////////////////////////////////////
+// RedirectError
+//////////////////////////////////////////////////////////
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum RedirectError {
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+    #[error(transparent)]
+    TomlError(#[from] toml::de::Error),
+    #[error("recursive config of 'replace_with' in config.toml file'")]
+    RecursiveConfig,
+}

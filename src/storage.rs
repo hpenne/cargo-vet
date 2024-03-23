@@ -21,6 +21,7 @@ use tar::Archive;
 use toml;
 use tracing::{error, info, log::warn, trace};
 
+use crate::errors::RedirectError;
 use crate::{
     criteria::CriteriaMapper,
     errors::{
@@ -257,7 +258,7 @@ impl Store {
     ) -> Result<Self, StoreAcquireError> {
         let mut this = Self::acquire_offline(cfg)?;
         if let Some(network) = network {
-            let cache = Cache::acquire(cfg, Some(&network)).map_err(Box::new)?;
+            let cache = Cache::acquire(cfg, Some(network)).map_err(Box::new)?;
             tokio::runtime::Handle::current().block_on(this.go_online(
                 cfg,
                 network,
@@ -754,7 +755,7 @@ impl Store {
         package: PackageStr<'_>,
     ) -> Result<&[CratesPublisher], CertifyError> {
         if let (Some(network), Some(live_imports)) = (network, self.live_imports.as_mut()) {
-            let cache = Cache::acquire(cfg, Some(&network))?;
+            let cache = Cache::acquire(cfg, Some(network))?;
             tokio::runtime::Handle::current().block_on(import_publisher_versions(
                 &cfg.metadata,
                 network,
@@ -1737,7 +1738,7 @@ impl Cache {
                 diff_cache_path: None,
                 command_history_path: None,
                 publisher_cache_path: None,
-                registry_urls: get_registry_urls(None),
+                registry_urls: get_registry_urls(None)?,
                 diff_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFFS),
                 now: cfg.now,
                 state: Mutex::new(CacheState {
@@ -1804,7 +1805,7 @@ impl Cache {
             diff_cache_path: Some(diff_cache_path),
             command_history_path: Some(command_history_path),
             publisher_cache_path: Some(publisher_cache_path),
-            registry_urls: get_registry_urls(network),
+            registry_urls: get_registry_urls(network)?,
             diff_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_DIFFS),
             now: cfg.now,
             state: Mutex::new(CacheState {
@@ -3054,31 +3055,34 @@ fn store_publisher_cache(publisher_cache: CratesCache) -> Result<String, StoreJs
     store_json(publisher_cache)
 }
 
-fn get_registry_for(source: &str, table: &toml::value::Table, remaining_depth: usize) -> Option<String> {
+fn get_registry_for(
+    source: &str,
+    table: &toml::value::Table,
+    remaining_depth: usize,
+) -> Result<Option<String>, RedirectError> {
     if remaining_depth == 0 {
         // To prevent infinite recursion in case of bad setups
-        return None;
+        return Err(RedirectError::RecursiveConfig);
     }
     if let Some(toml::Value::Table(t)) = table.get(source) {
         if let Some(toml::Value::String(redirect)) = t.get("replace-with") {
             return get_registry_for(redirect, table, remaining_depth - 1);
         }
         if let Some(toml::Value::String(registry)) = t.get("registry") {
-            return Some(registry.into());
+            return Ok(Some(registry.into()));
         }
     }
-    None
+    Ok(None)
 }
 
-pub fn get_registry_url_from_config(cargo_config: &str) -> Option<String> {
-    cargo_config
-        .parse::<toml::Value>()
-        .ok()
-        .as_ref()
-        .and_then(|v| v.as_table())
+pub fn get_registry_url_from_config(cargo_config: &str) -> Result<Option<String>, RedirectError> {
+    return cargo_config
+        .parse::<toml::Value>()?
+        .as_table()
         .and_then(|t| t.get("source"))
         .and_then(|s| s.as_table())
-        .and_then(|sources| get_registry_for("crates-io", sources, 5))
+        .and_then(|s| get_registry_for("crates-io", s, 5).transpose())
+        .transpose();
 }
 
 pub fn read_cargo_config_from_dir(dir: &Path) -> Option<String> {
@@ -3093,33 +3097,29 @@ pub fn read_cargo_config_from_dir(dir: &Path) -> Option<String> {
     None
 }
 
-fn get_registry_url_from_dir(dir: &Path) -> Option<String> {
-    read_cargo_config_from_dir(dir).and_then(|config| get_registry_url_from_config(&config))
+fn get_registry_url_from_dir(dir: &Path) -> Result<Option<String>, RedirectError> {
+    read_cargo_config_from_dir(dir)
+        .and_then(|config| get_registry_url_from_config(&config).transpose())
+        .transpose()
 }
 
-fn get_registry_index_url() -> Option<String> {
+fn get_registry_index_url() -> Result<Option<String>, RedirectError> {
     // Check all locations from the current dir up to the root, as described here:
     // https://doc.rust-lang.org/cargo/reference/config.html?highlight=replace-with#hierarchical-structure
-    if let Ok(mut dir) = env::current_dir() {
-        loop {
-            dir.push(".cargo");
-            if let Some(url) = get_registry_url_from_dir(&dir) {
-                return Some(url);
-            }
-            dir.pop();
-            if !dir.pop() {
-                break;
-            }
+    let mut dir = env::current_dir()?;
+    loop {
+        dir.push(".cargo");
+        if let Some(url) = get_registry_url_from_dir(&dir)? {
+            return Ok(Some(url));
+        }
+        dir.pop();
+        if !dir.pop() {
+            break;
         }
     }
+
     // Try the user's cargo home:
-    if let Some(url) = home::cargo_home()
-        .ok()
-        .and_then(|dir| get_registry_url_from_dir(&dir))
-    {
-        return Some(url);
-    }
-    None
+    get_registry_url_from_dir(&home::cargo_home()?)
 }
 
 pub struct RegistryUrls {
@@ -3129,11 +3129,11 @@ pub struct RegistryUrls {
     api: String,
 }
 
-pub fn get_registry_urls(network: Option<&Network>) -> RegistryUrls {
+pub fn get_registry_urls(network: Option<&Network>) -> Result<RegistryUrls, RedirectError> {
     // Read the config.json file from the registry index,
     // then parse that to find the URL for the web API
     if let Some(network) = network {
-        if let Some(index) = get_registry_index_url() {
+        if let Some(index) = get_registry_index_url()? {
             let config_url = index.clone() + "/config.json";
             if let Ok(url) = Url::parse(&config_url) {
                 // Download the config.json:
@@ -3148,7 +3148,7 @@ pub fn get_registry_urls(network: Option<&Network>) -> RegistryUrls {
                         .map(|v: Value| v["api"].clone())
                         .map(|v| v.to_string())
                     {
-                        return RegistryUrls { index, api };
+                        return Ok(RegistryUrls { index, api });
                     }
                 }
             }
@@ -3156,8 +3156,8 @@ pub fn get_registry_urls(network: Option<&Network>) -> RegistryUrls {
     }
 
     // Defaults:
-    RegistryUrls {
+    Ok(RegistryUrls {
         index: "https://index.crates.io".into(),
         api: "https://crates.io/api/v1/crates".into(),
-    }
+    })
 }
