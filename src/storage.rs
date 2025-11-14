@@ -2682,10 +2682,10 @@ impl<'a> UpdateCratesCache<'a> {
         let name = self.crate_name;
         use std::fmt::Write;
         match name.len() {
-            1 => write!(url, "/1/{name}"),
-            2 => write!(url, "/2/{name}"),
-            3 => write!(url, "/3/{}/{name}", &name[0..1]),
-            _ => write!(url, "/{}/{}/{name}", &name[0..2], &name[2..4]),
+            1 => write!(url, "1/{name}"),
+            2 => write!(url, "2/{name}"),
+            3 => write!(url, "3/{}/{name}", &name[0..1]),
+            _ => write!(url, "{}/{}/{name}", &name[0..2], &name[2..4]),
         }
         .expect("writing to a String should not fail");
         // Crate index always use lowercases, but crate name may contain uppercase characters.
@@ -3135,11 +3135,10 @@ pub fn get_registry_urls(network: Option<&Network>) -> Result<RegistryUrls, Redi
     if let Some(network) = network {
         if let Some(index) = get_registry_index_url()? {
             let index = index.strip_prefix("sparse+").unwrap_or(&index).to_string();
-            let mut config_url = index.clone();
-            if !config_url.ends_with("/") {
-                config_url.push('/');
+            if !index.ends_with("/") {
+                index.push('/');
             }
-            config_url.push_str("config.json");
+            let config_url = index.clone() + "config.json";
             if let Ok(url) = Url::parse(&config_url) {
                 // Download the config.json:
                 if let Some(config) = tokio::runtime::Handle::current()
@@ -3162,7 +3161,7 @@ pub fn get_registry_urls(network: Option<&Network>) -> Result<RegistryUrls, Redi
 
     // Defaults:
     Ok(RegistryUrls {
-        index: "https://index.crates.io".into(),
+        index: "https://index.crates.io/".into(),
         api: "https://crates.io/api/v1/crates".into(),
     })
 }
