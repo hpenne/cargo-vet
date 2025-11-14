@@ -3134,7 +3134,12 @@ pub fn get_registry_urls(network: Option<&Network>) -> Result<RegistryUrls, Redi
     // then parse that to find the URL for the web API
     if let Some(network) = network {
         if let Some(index) = get_registry_index_url()? {
-            let config_url = index.clone() + "/config.json";
+            let index = index.strip_prefix("sparse+").unwrap_or(&index).to_string();
+            let mut config_url = index.clone();
+            if !config_url.ends_with("/") {
+                config_url.push('/');
+            }
+            config_url.push_str("config.json");
             if let Ok(url) = Url::parse(&config_url) {
                 // Download the config.json:
                 if let Some(config) = tokio::runtime::Handle::current()
