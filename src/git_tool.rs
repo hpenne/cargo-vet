@@ -136,7 +136,7 @@ pub struct Editor<'a> {
     run_editor: Box<dyn FnOnce(&Path) -> io::Result<bool> + 'a>,
 }
 
-impl<'a> Editor<'a> {
+impl Editor<'_> {
     /// Create a new editor for a temporary file.
     pub fn new(name: &str) -> io::Result<Self> {
         let tempfile = tempfile::Builder::new()
@@ -172,12 +172,6 @@ impl<'a> Editor<'a> {
                 .find(|cc| *cc != '\0')
                 .expect("couldn't find a viable comment character"),
         );
-    }
-
-    #[cfg(test)]
-    /// Test-only method to mock out the actual invocation of the editor.
-    pub fn set_run_editor(&mut self, run_editor: impl FnOnce(&Path) -> io::Result<bool> + 'a) {
-        self.run_editor = Box::new(run_editor);
     }
 
     /// Add comment lines to the editor. Any newlines in the input will be
@@ -243,7 +237,7 @@ impl<'a> Editor<'a> {
             let line = line.trim_end();
             // Don't record 2 consecutive empty lines or empty lines at the
             // start of the file.
-            if line.is_empty() && lines.last().map_or(true, |l| l.is_empty()) {
+            if line.is_empty() && lines.last().is_none_or(|l| l.is_empty()) {
                 continue;
             }
             lines.push(line.to_owned());
@@ -257,6 +251,14 @@ impl<'a> Editor<'a> {
         }
 
         Ok(lines.join("\n"))
+    }
+}
+
+#[cfg(test)]
+impl<'a> Editor<'a> {
+    /// Test-only method to mock out the actual invocation of the editor.
+    pub fn set_run_editor(&mut self, run_editor: impl FnOnce(&Path) -> io::Result<bool> + 'a) {
+        self.run_editor = Box::new(run_editor);
     }
 }
 
@@ -343,7 +345,7 @@ impl<'a> Pager<'a> {
     }
 }
 
-impl<'a> io::Write for Pager<'a> {
+impl io::Write for Pager<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match &mut self.child {
             Some(child) => child.stdin.as_mut().unwrap().write(buf),

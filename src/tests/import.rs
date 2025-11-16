@@ -193,7 +193,11 @@ fn existing_peer_skip_import() {
         .user(1, "user1", "User One")
         .package(
             "third-party2",
-            &[reg_published_by(ver(DEFAULT_VER), Some(1), "2022-12-12")],
+            &[reg_published_by(
+                ver(DEFAULT_VER),
+                Some(1),
+                mock_weeks_ago(2),
+            )],
         )
         .serve(&mut network);
 
@@ -1650,15 +1654,15 @@ fn import_wildcard_audit_publisher() {
         .package(
             "third-party1",
             &[
-                reg_published_by(ver(DEFAULT_VER), Some(2), "2022-12-12"),
-                reg_published_by(ver(5), Some(2), "2022-12-12"),
+                reg_published_by(ver(DEFAULT_VER), Some(2), mock_weeks_ago(2)),
+                reg_published_by(ver(5), Some(2), mock_weeks_ago(2)),
             ],
         )
         .package(
             "third-party2",
             &[
-                reg_published_by(ver(DEFAULT_VER), Some(1), "2022-12-12"),
-                reg_published_by(ver(5), Some(2), "2022-12-12"),
+                reg_published_by(ver(DEFAULT_VER), Some(1), mock_weeks_ago(2)),
+                reg_published_by(ver(5), Some(2), mock_weeks_ago(2)),
             ],
         )
         .serve(&mut network);
@@ -1983,7 +1987,11 @@ fn existing_import_kept_despite_local_wildcard_audit() {
         .user(1, "user1", "User One")
         .package(
             "third-party2",
-            &[reg_published_by(ver(DEFAULT_VER), Some(1), "2022-12-15")],
+            &[reg_published_by(
+                ver(DEFAULT_VER),
+                Some(1),
+                mock_weeks_ago(2),
+            )],
         )
         .serve(&mut network);
     network.mock_serve_toml(FOREIGN_URL, &foreign_audits);
@@ -2044,10 +2052,55 @@ fn local_wildcard_audit_preferred_to_fresh_import() {
         .user(1, "user1", "User One")
         .package(
             "third-party2",
-            &[reg_published_by(ver(DEFAULT_VER), Some(1), "2022-12-15")],
+            &[reg_published_by(
+                ver(DEFAULT_VER),
+                Some(1),
+                mock_weeks_ago(2),
+            )],
         )
         .serve(&mut network);
     network.mock_serve_toml(FOREIGN_URL, &foreign_audits);
+
+    let store = Store::mock_online(&cfg, config, audits, imports, &network, true).unwrap();
+
+    let output = get_imports_file_changes_noprune(&metadata, &store);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn wildcard_audit_trustpub_import() {
+    // (Pass) If we have a wildcard audit for a crate using a trusted publisher,
+    // it should be correctly fetched from the API.
+
+    let _enter = TEST_RUNTIME.enter();
+    let mock = MockMetadata::simple();
+
+    let metadata = mock.metadata();
+    let (config, mut audits, imports) = builtin_files_full_audited(&metadata);
+
+    audits.audits.remove("third-party2");
+
+    audits.wildcard_audits.insert(
+        "third-party2".to_owned(),
+        vec![wildcard_audit_trustpub(
+            "github:testing/third-party2",
+            SAFE_TO_DEPLOY,
+        )],
+    );
+
+    let cfg = mock_cfg(&metadata);
+
+    let mut network = Network::new_mock();
+    MockRegistryBuilder::new()
+        .package(
+            "third-party2",
+            &[reg_trustpub_by(
+                ver(DEFAULT_VER),
+                "github:testing/third-party2",
+                mock_weeks_ago(2),
+            )],
+        )
+        .serve(&mut network);
 
     let store = Store::mock_online(&cfg, config, audits, imports, &network, true).unwrap();
 

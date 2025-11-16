@@ -1,6 +1,7 @@
 use std::{path::PathBuf, str::FromStr};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 use tracing::level_filters::LevelFilter;
 
 use crate::format::{CriteriaName, ImportName, PackageName, VersionReq, VetVersion};
@@ -16,8 +17,8 @@ pub enum FakeCli {
 #[derive(clap::Args)]
 #[clap(version)]
 #[clap(bin_name = "cargo vet")]
+#[clap(display_name = "cargo-vet")]
 #[clap(args_conflicts_with_subcommands = true)]
-#[clap(global_setting(clap::AppSettings::DeriveDisplayOrder))]
 /// Supply-chain security for Rust
 ///
 /// When run without a subcommand, `cargo vet` will invoke the `check`
@@ -29,13 +30,13 @@ pub struct Cli {
 
     // Top-level flags
     /// Path to Cargo.toml
-    #[clap(long, name = "PATH", parse(from_os_str))]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(long, name = "PATH")]
+    #[clap(help_heading = "Global Options", global = true)]
     pub manifest_path: Option<PathBuf>,
 
     /// Path to the supply-chain directory
-    #[clap(long, name = "STORE_PATH", parse(from_os_str))]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(long, name = "STORE_PATH")]
+    #[clap(help_heading = "Global Options", global = true)]
     pub store_path: Option<PathBuf>,
 
     /// Don't use --all-features
@@ -43,64 +44,63 @@ pub struct Cli {
     /// We default to passing --all-features to `cargo metadata`
     /// because we want to analyze your full dependency tree
     #[clap(long, action)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub no_all_features: bool,
 
     /// Do not activate the `default` feature
     #[clap(long, action)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub no_default_features: bool,
 
     /// Space-separated list of features to activate
-    #[clap(long, action, require_value_delimiter = true, value_delimiter = ' ')]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(long, action, value_delimiter = ' ')]
+    #[clap(help_heading = "Global Options", global = true)]
     pub features: Vec<String>,
 
     /// Do not fetch new imported audits.
     #[clap(long, action)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub locked: bool,
 
     /// Avoid the network entirely, requiring either that the cargo cache is
     /// populated or the dependencies are vendored. Requires --locked.
     #[clap(long, action)]
     #[clap(requires = "locked")]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub frozen: bool,
 
     /// Prevent commands such as `check` and `certify` from automatically
     /// cleaning up unused exemptions.
     #[clap(long, action)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub no_minimize_exemptions: bool,
 
     /// Prevent commands such as `check` and `suggest` from suggesting registry
     /// imports.
     #[clap(long, action)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub no_registry_suggestions: bool,
 
     /// How verbose logging should be (log level)
     #[clap(long, action)]
-    #[clap(default_value_t = LevelFilter::WARN)]
-    #[clap(possible_values = ["off", "error", "warn", "info", "debug", "trace"])]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
-    pub verbose: LevelFilter,
+    #[clap(default_value = "warn")]
+    #[clap(help_heading = "Global Options", global = true)]
+    pub verbose: VetLevelFilter,
 
     /// Instead of stdout, write output to this file
     #[clap(long, action)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub output_file: Option<PathBuf>,
 
     /// Instead of stderr, write logs to this file (only used after successful CLI parsing)
     #[clap(long, action)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub log_file: Option<PathBuf>,
 
     /// The format of the output
     #[clap(long, value_enum, action)]
     #[clap(default_value_t = OutputFormat::Human)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub output_format: OutputFormat,
 
     /// Use the following path instead of the global cache directory
@@ -112,12 +112,12 @@ pub struct Cli {
     ///
     /// This mostly exists for testing vet itself.
     #[clap(long, action)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub cache_dir: Option<PathBuf>,
 
     /// The date and time to use as now.
     #[clap(long, action, hide = true)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub current_time: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Filter out different parts of the build graph and pretend that's the true graph
@@ -163,7 +163,7 @@ pub struct Cli {
     /// * `is_dev_only($bool)`: whether it's only used by dev (test) builds in the original graph
     #[clap(long, action)]
     #[clap(verbatim_doc_comment)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub filter_graph: Option<Vec<GraphFilter>>,
 
     /// Arguments to pass through to cargo. It can be specified multiple times for
@@ -173,7 +173,7 @@ pub struct Cli {
     ///
     /// This allows using unstable options in Cargo if a project's Cargo.toml requires them.
     #[clap(long, action)]
-    #[clap(help_heading = "GLOBAL OPTIONS", global = true)]
+    #[clap(help_heading = "Global Options", global = true)]
     pub cargo_arg: Vec<String>,
 
     // Args for `Check` when the subcommand is not explicitly specified.
@@ -368,6 +368,13 @@ pub enum Commands {
     #[clap(disable_version_flag = true)]
     Aggregate(AggregateArgs),
 
+    /// Print the computed audit path used by cargo-vet to certify a package for
+    /// a given critera.
+    ///
+    /// This is a debugging command, and the output's format is not guaranteed.
+    #[clap(disable_version_flag = true)]
+    ExplainAudit(ExplainAuditArgs),
+
     /// Print the cargo build graph as understood by `cargo vet`
     ///
     /// This is a debugging command, the output's format is not guaranteed.
@@ -455,7 +462,7 @@ pub struct CheckArgs {}
 #[derive(clap::Args)]
 pub struct InitArgs {}
 
-/// Fetches the crate to a temp location and pushd's to it
+/// Inspect a crate at a specific version
 #[derive(clap::Args)]
 pub struct InspectArgs {
     /// The package to inspect
@@ -465,11 +472,16 @@ pub struct InspectArgs {
     #[clap(action)]
     pub version: VetVersion,
     /// How to inspect the source
-    #[clap(long, action, default_value = "sourcegraph")]
-    pub mode: FetchMode,
+    ///
+    /// Defaults to the most recently used --mode argument, or diff.rs if no
+    /// mode argument has been used.
+    ///
+    /// This option is ignored if a git version is passed.
+    #[clap(long, action)]
+    pub mode: Option<FetchMode>,
 }
 
-/// Emits a diff of the two versions
+/// View a diff between two versions of the given crate
 #[derive(clap::Args)]
 pub struct DiffArgs {
     /// The package to diff
@@ -481,9 +493,14 @@ pub struct DiffArgs {
     /// The target version to diff
     #[clap(action)]
     pub version2: VetVersion,
-    /// How to inspect the source
-    #[clap(long, action, default_value = "sourcegraph")]
-    pub mode: FetchMode,
+    /// How to inspect the diff
+    ///
+    /// Defaults to the most recently used --mode argument, or diff.rs if no
+    /// mode argument has been used.
+    ///
+    /// This option is ignored if a git version is passed.
+    #[clap(long, action)]
+    pub mode: Option<FetchMode>,
 }
 
 /// Certifies a package as audited
@@ -498,10 +515,15 @@ pub struct CertifyArgs {
     /// If present, instead certify a diff from version1->version2
     #[clap(action)]
     pub version2: Option<VetVersion>,
-    /// If present, certify a wildcard audit for the user with the given username.
+    /// If present, certify a wildcard audit for the user with the given
+    /// username, or trusted publisher with the given signature.
     ///
     /// Use the --start-date and --end-date options to specify the date range to
     /// certify for.
+    ///
+    /// NOTE: Trusted publisher signatures have a provider-specific format:
+    ///
+    ///  * GitHub Actions: `github:organization/repository`
     #[clap(long, action, conflicts_with("version1"), requires("package"))]
     pub wildcard: Option<String>,
     /// The criteria to certify for this audit
@@ -576,13 +598,13 @@ pub struct TrustArgs {
     /// Must be specified unless --all has been specified.
     #[clap(action, required_unless_present("all"))]
     pub package: Option<PackageName>,
-    /// The username of the publisher to trust
+    /// The username or trusted publisher signature of the publisher to trust
     ///
     /// If not provided, will be inferred to be the sole known publisher of the
     /// given crate. If there is more than one publisher for the given crate,
     /// the login must be provided explicitly.
     #[clap(action)]
-    pub publisher_login: Option<String>,
+    pub publisher_identifier: Option<String>,
     /// The criteria to certify for this trust entry
     ///
     /// If not provided, we will prompt you for this information.
@@ -605,7 +627,7 @@ pub struct TrustArgs {
     #[clap(long, action)]
     pub notes: Option<String>,
     /// If specified, trusts all packages with exemptions or failures which are
-    /// solely published by the given user.
+    /// solely published by the given user or trusted publisher signature.
     #[clap(long, action, conflicts_with("package"))]
     pub all: Option<String>,
     /// If specified along with --all, also trusts packages with multiple
@@ -736,8 +758,13 @@ pub struct GcArgs {
 pub struct RenewArgs {
     // Change this doc string if the WILDCARD_AUDIT_EXPIRATION_STRING changes.
     /// Renew all wildcard audits which will have expired six weeks from now.
-    #[clap(long, action, conflicts_with("crate-name"))]
+    #[clap(long, action, conflicts_with("crate_name"))]
     pub expiring: bool,
+
+    /// Renew wildcard audits for inactive crates which have not been updated
+    /// in 4 months.
+    #[clap(long, action, requires("expiring"))]
+    pub include_inactive: bool,
 
     /// The name of a crate to renew.
     #[clap(value_name("CRATE"), action, required_unless_present("expiring"))]
@@ -761,6 +788,20 @@ pub enum DumpGraphDepth {
     Full,
 }
 
+#[derive(clap::Args)]
+pub struct ExplainAuditArgs {
+    /// The package to display the audit path for
+    #[clap(action)]
+    pub package: PackageName,
+    /// The version to display the audit path for
+    #[clap(action)]
+    pub version: Option<VetVersion>,
+    /// The criteria to display the audit path for
+    #[clap(action)]
+    #[clap(default_value = "safe-to-deploy")]
+    pub criteria: CriteriaName,
+}
+
 /// Logging verbosity levels
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum Verbose {
@@ -772,49 +813,12 @@ pub enum Verbose {
     Trace,
 }
 
-#[derive(Clone, Debug)]
-pub struct DependencyCriteriaArg {
-    pub dependency: PackageName,
-    pub criteria: CriteriaName,
-}
-
-impl FromStr for DependencyCriteriaArg {
-    // the error must be owned as well
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        use nom::{
-            bytes::complete::{is_not, tag},
-            combinator::all_consuming,
-            error::{convert_error, VerboseError},
-            sequence::tuple,
-            Finish, IResult,
-        };
-        type ParseResult<I, O> = IResult<I, O, VerboseError<I>>;
-
-        fn parse(input: &str) -> ParseResult<&str, DependencyCriteriaArg> {
-            let (rest, (dependency, _, criteria)) =
-                all_consuming(tuple((is_not(":"), tag(":"), is_not(":"))))(input)?;
-            Ok((
-                rest,
-                DependencyCriteriaArg {
-                    dependency: dependency.to_string(),
-                    criteria: criteria.to_string(),
-                },
-            ))
-        }
-
-        match parse(s).finish() {
-            Ok((_remaining, val)) => Ok(val),
-            Err(e) => Err(convert_error(s, e)),
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum, Serialize, Deserialize)]
 pub enum FetchMode {
     Local,
     Sourcegraph,
+    #[clap(name = "diff.rs")]
+    DiffRs,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -967,7 +971,7 @@ impl FromStr for GraphFilter {
             })?;
             Ok((rest, val))
         }
-        fn ws<'a, F: 'a, O, E: ParseError<&'a str>>(
+        fn ws<'a, F, O, E: ParseError<&'a str>>(
             inner: F,
         ) -> impl FnMut(&'a str) -> IResult<&'a str, O, E>
         where
@@ -979,6 +983,31 @@ impl FromStr for GraphFilter {
         match parse(s).finish() {
             Ok((_remaining, val)) => Ok(val),
             Err(e) => Err(convert_error(s, e)),
+        }
+    }
+}
+
+/// Crate-local definition of the LevelFilter type to support
+/// #[derive(ValueEnum)].
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
+pub enum VetLevelFilter {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<VetLevelFilter> for LevelFilter {
+    fn from(value: VetLevelFilter) -> Self {
+        match value {
+            VetLevelFilter::Off => LevelFilter::OFF,
+            VetLevelFilter::Error => LevelFilter::ERROR,
+            VetLevelFilter::Warn => LevelFilter::WARN,
+            VetLevelFilter::Info => LevelFilter::INFO,
+            VetLevelFilter::Debug => LevelFilter::DEBUG,
+            VetLevelFilter::Trace => LevelFilter::TRACE,
         }
     }
 }

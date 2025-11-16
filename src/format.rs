@@ -1,13 +1,15 @@
 //! Details of the file formats used by cargo vet
 
+use crate::cli::FetchMode;
 use crate::errors::{StoreVersionParseError, VersionParseError};
 use crate::resolver::{DiffRecommendation, ViolationConflict};
-use crate::serialization::spanned::Spanned;
+use crate::serialization::{spanned::Spanned, CacheFileVersion, Tidyable};
 use crate::{flock::Filesystem, serialization};
 use core::{cmp, fmt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use cargo_metadata::{semver, Package};
 use serde::{de, de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
@@ -26,6 +28,7 @@ pub type PackageStr<'a> = &'a str;
 pub type ImportName = String;
 pub type ImportStr<'a> = &'a str;
 pub type CratesUserId = u64;
+pub type CratesTrustpubSignature = String;
 
 // newtype VersionReq so that we can implement PartialOrd on it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,6 +97,16 @@ impl VetVersion {
     pub fn equals_semver(&self, semver: &semver::Version) -> bool {
         self.git_rev.is_none() && &self.semver == semver
     }
+
+    /// Get this VetVersion as a semver::Version, returning None if this version
+    /// corresponds to a git revision.
+    pub fn as_semver(&self) -> Option<&semver::Version> {
+        if self.git_rev.is_none() {
+            Some(&self.semver)
+        } else {
+            None
+        }
+    }
 }
 impl fmt::Display for VetVersion {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -124,7 +137,7 @@ impl<'de> Deserialize<'de> for VetVersion {
     {
         struct VersionVisitor;
 
-        impl<'de> Visitor<'de> for VersionVisitor {
+        impl Visitor<'_> for VersionVisitor {
             type Value = VetVersion;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -235,19 +248,27 @@ pub struct AuditsFile {
     pub trusted: TrustedPackages,
 }
 
+impl Tidyable for AuditsFile {
+    fn tidy(&mut self) {
+        self.audits.tidy();
+        self.wildcard_audits.tidy();
+        self.trusted.tidy();
+    }
+}
+
 /// Foreign audits.toml with unparsed entries and audits. Should have the same
 /// structure as `AuditsFile`, but with individual audits and criteria unparsed.
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct ForeignAuditsFile {
     #[serde(default)]
-    pub criteria: SortedMap<CriteriaName, toml::Value>,
+    pub criteria: SortedMap<CriteriaName, toml::Table>,
     #[serde(default)]
     #[serde(rename = "wildcard-audits")]
-    pub wildcard_audits: SortedMap<PackageName, Vec<toml::Value>>,
+    pub wildcard_audits: SortedMap<PackageName, Vec<toml::Table>>,
     #[serde(default)]
-    pub audits: SortedMap<PackageName, Vec<toml::Value>>,
+    pub audits: SortedMap<PackageName, Vec<toml::Table>>,
     #[serde(default)]
-    pub trusted: SortedMap<PackageName, Vec<toml::Value>>,
+    pub trusted: SortedMap<PackageName, Vec<toml::Table>>,
 }
 
 /// Information on a Criteria
@@ -421,7 +442,7 @@ impl<'de> Deserialize<'de> for Delta {
     {
         struct DeltaVisitor;
 
-        impl<'de> Visitor<'de> for DeltaVisitor {
+        impl Visitor<'_> for DeltaVisitor {
             type Value = Delta;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -471,6 +492,19 @@ impl fmt::Display for Delta {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(untagged)]
+pub enum CratesSourceId {
+    User {
+        #[serde(rename = "user-id")]
+        user_id: CratesUserId,
+    },
+    TrustedPublisher {
+        #[serde(rename = "trusted-publisher")]
+        trusted_publisher: CratesTrustpubSignature,
+    },
+}
+
 /// An entry specifying a wildcard audit for a specific crate based on crates.io
 /// publication time and user-id.
 ///
@@ -483,8 +517,8 @@ pub struct WildcardEntry {
     pub who: Vec<Spanned<String>>,
     #[serde(with = "serialization::string_or_vec")]
     pub criteria: Vec<Spanned<CriteriaName>>,
-    #[serde(rename = "user-id")]
-    pub user_id: CratesUserId,
+    #[serde(flatten)]
+    pub source: CratesSourceId,
     pub start: Spanned<chrono::NaiveDate>,
     pub end: Spanned<chrono::NaiveDate>,
     pub renew: Option<bool>,
@@ -505,7 +539,7 @@ impl WildcardEntry {
     pub fn same_audit_as(&self, other: &WildcardEntry) -> bool {
         // Ignore `who` and `notes` for comparison, as they are not relevant
         // semantically and might have been updated uneventfully.
-        self.user_id == other.user_id
+        self.source == other.source
             && self.start == other.start
             && self.end == other.end
             && self.criteria == other.criteria
@@ -528,8 +562,8 @@ impl WildcardEntry {
 pub struct TrustEntry {
     #[serde(with = "serialization::string_or_vec")]
     pub criteria: Vec<Spanned<CriteriaName>>,
-    #[serde(rename = "user-id")]
-    pub user_id: CratesUserId,
+    #[serde(flatten)]
+    pub source: CratesSourceId,
     pub start: Spanned<chrono::NaiveDate>,
     pub end: Spanned<chrono::NaiveDate>,
     pub notes: Option<String>,
@@ -581,6 +615,12 @@ pub struct ConfigFile {
     #[serde(default)]
     #[serde(alias = "unaudited")]
     pub exemptions: SortedMap<PackageName, Vec<ExemptedDependency>>,
+}
+
+impl Tidyable for ConfigFile {
+    fn tidy(&mut self) {
+        self.exemptions.tidy();
+    }
 }
 
 pub static SAFE_TO_DEPLOY: CriteriaStr = "safe-to-deploy";
@@ -678,7 +718,7 @@ impl Policy {
     }
 
     /// Return an iterator over defined policies.
-    pub fn iter(&self) -> PolicyIter {
+    pub fn iter(&self) -> PolicyIter<'_> {
         PolicyIter {
             iter: self.package.iter(),
             versioned: None,
@@ -946,7 +986,7 @@ impl<'de> Deserialize<'de> for StoreVersion {
     {
         struct VersionVisitor;
 
-        impl<'de> Visitor<'de> for VersionVisitor {
+        impl Visitor<'_> for VersionVisitor {
             type Value = StoreVersion;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1011,6 +1051,96 @@ pub struct ImportsFile {
     pub audits: SortedMap<ImportName, AuditsFile>,
 }
 
+impl Tidyable for ImportsFile {
+    fn tidy(&mut self) {
+        self.unpublished.tidy();
+        self.publisher.tidy();
+        for audits_file in self.audits.values_mut() {
+            audits_file.tidy();
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(untagged)]
+pub enum CratesPublisherSource {
+    User {
+        #[serde(rename = "user-id")]
+        user_id: CratesUserId,
+        #[serde(rename = "user-login")]
+        user_login: String,
+        #[serde(rename = "user-name")]
+        user_name: Option<String>,
+    },
+    TrustedPublisher {
+        #[serde(rename = "trusted-publisher")]
+        trusted_publisher: CratesTrustpubSignature,
+    },
+}
+
+impl CratesPublisherSource {
+    pub fn as_identifier(&self) -> &str {
+        match self {
+            CratesPublisherSource::User { user_login, .. } => &user_login[..],
+            CratesPublisherSource::TrustedPublisher { trusted_publisher } => &trusted_publisher[..],
+        }
+    }
+
+    pub fn as_wildcard_source(&self) -> CratesSourceId {
+        match self {
+            CratesPublisherSource::User { user_id, .. } => {
+                CratesSourceId::User { user_id: *user_id }
+            }
+            CratesPublisherSource::TrustedPublisher { trusted_publisher } => {
+                CratesSourceId::TrustedPublisher {
+                    trusted_publisher: trusted_publisher.clone(),
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for CratesPublisherSource {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            CratesPublisherSource::User {
+                user_login,
+                user_name: Some(user_name),
+                ..
+            } => write!(f, "{} ({})", user_name, user_login),
+            CratesPublisherSource::User { user_login, .. } => write!(f, "{}", user_login),
+            CratesPublisherSource::TrustedPublisher { trusted_publisher } => {
+                write!(f, "{}", trusted_publisher)
+            }
+        }
+    }
+}
+
+impl PartialEq<CratesSourceId> for CratesPublisherSource {
+    fn eq(&self, other: &CratesSourceId) -> bool {
+        match (self, other) {
+            (
+                CratesPublisherSource::User { user_id: us, .. },
+                CratesSourceId::User { user_id: them },
+            ) => us == them,
+            (
+                CratesPublisherSource::TrustedPublisher {
+                    trusted_publisher: us,
+                },
+                CratesSourceId::TrustedPublisher {
+                    trusted_publisher: them,
+                },
+            ) => us == them,
+            _ => false,
+        }
+    }
+}
+impl PartialEq<CratesPublisherSource> for CratesSourceId {
+    fn eq(&self, other: &CratesPublisherSource) -> bool {
+        other == self
+    }
+}
+
 /// Information about who published a specific version of a crate to be cached
 /// in imports.lock.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1020,12 +1150,8 @@ pub struct CratesPublisher {
     // is easier to use within the resolver.
     pub version: VetVersion,
     pub when: chrono::NaiveDate,
-    #[serde(rename = "user-id")]
-    pub user_id: CratesUserId,
-    #[serde(rename = "user-login")]
-    pub user_login: String,
-    #[serde(rename = "user-name")]
-    pub user_name: Option<String>,
+    #[serde(flatten)]
+    pub source: CratesPublisherSource,
     /// See `AuditEntry::is_fresh_import`.
     #[serde(skip)]
     pub is_fresh_import: bool,
@@ -1058,27 +1184,14 @@ pub struct UnpublishedEntry {
 //                                                                                //
 ////////////////////////////////////////////////////////////////////////////////////
 
-/// The current DiffCache file format in a tagged enum.
-///
-/// If we fail to read the DiffCache it will be silently re-built, meaning that
-/// the version enum tag can be changed to force the DiffCache to be
-/// re-generated after a breaking change to the format, such as a change to how
-/// diffs are computed or identified.
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(tag = "version")]
-pub enum DiffCache {
-    #[serde(rename = "2")]
-    V2 {
-        diffs: SortedMap<PackageName, SortedMap<Delta, DiffStat>>,
-    },
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct DiffCache {
+    pub version: CacheFileVersion<2>,
+    pub diffs: SortedMap<PackageName, SortedMap<Delta, DiffStat>>,
 }
 
-impl Default for DiffCache {
-    fn default() -> Self {
-        DiffCache::V2 {
-            diffs: SortedMap::new(),
-        }
-    }
+impl Tidyable for DiffCache {
+    fn tidy(&mut self) {}
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
@@ -1131,7 +1244,7 @@ pub enum FetchCommand {
 }
 
 impl FetchCommand {
-    pub fn package(&self) -> PackageStr {
+    pub fn package(&self) -> PackageStr<'_> {
         match self {
             FetchCommand::Inspect { package, .. } => package,
             FetchCommand::Diff { package, .. } => package,
@@ -1141,8 +1254,10 @@ impl FetchCommand {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CommandHistory {
+    pub version: CacheFileVersion<1>,
     #[serde(flatten)]
     pub last_fetch: Option<FetchCommand>,
+    pub last_fetch_mode: Option<FetchMode>,
 }
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -1173,35 +1288,20 @@ impl fmt::Display for CratesCacheUser {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CratesCacheVersionDetails {
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub published_by: Option<CratesUserId>,
+    pub source: Option<CratesSourceId>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct CratesCacheEntry {
-    pub last_fetched: chrono::DateTime<chrono::Utc>,
-    /// If versions is empty, this indicates that we queried the info and found that the crate has
-    /// no published versions (and thus doesn't exist as of `last_fetched`).
-    ///
-    /// Versions are a sorted map because we sometimes need to iterate in order. We don't use a sorted
-    /// Vec because we may partially update the versions when we access the index (though technically
-    /// that update _should_ only have new versions which would append to a Vec if it were that).
-    pub versions: SortedMap<semver::Version, Option<CratesCacheVersionDetails>>,
-    pub metadata: Option<CratesAPICrateMetadata>,
+    pub versions: SortedMap<semver::Version, CratesCacheVersionDetails>,
+    pub metadata: CratesAPICrateMetadata,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct CratesCache {
+    pub version: CacheFileVersion<2>,
     pub users: SortedMap<CratesUserId, CratesCacheUser>,
-    pub crates: SortedMap<PackageName, CratesCacheEntry>,
-}
-
-impl CratesCacheEntry {
-    /// Return whether the crate exists.
-    ///
-    /// The cache stores non-existent results when fetching.
-    pub fn exists(&self) -> bool {
-        !self.versions.is_empty()
-    }
+    pub crates: SortedMap<PackageName, Arc<CratesCacheEntry>>,
 }
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -1223,11 +1323,31 @@ pub struct CratesAPIUser {
 }
 
 // NOTE: This is a subset of the format returned from the crates.io v1 API.
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(tag = "provider")]
+pub enum CratesAPITrustpubData {
+    #[serde(rename = "github")]
+    GitHub { repository: String },
+    #[serde(other)]
+    Unknown,
+}
+
+impl CratesAPITrustpubData {
+    pub fn as_signature(&self) -> Option<CratesTrustpubSignature> {
+        match self {
+            CratesAPITrustpubData::GitHub { repository } => Some(format!("github:{repository}")),
+            CratesAPITrustpubData::Unknown => None,
+        }
+    }
+}
+
+// NOTE: This is a subset of the format returned from the crates.io v1 API.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CratesAPIVersion {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub num: semver::Version,
     pub published_by: Option<CratesAPIUser>,
+    pub trustpub_data: Option<CratesAPITrustpubData>,
 }
 
 // NOTE: This is a subset of the format returned from the crates.io v1 API.

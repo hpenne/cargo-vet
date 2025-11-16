@@ -28,7 +28,10 @@ use crate::{
 /// Wrapper for the pair of a `reqwest::Response` and the `SemaphorePermit` used
 /// to limit concurrent connections, with a test-only variant for mocking.
 enum Response<'a> {
-    Real(reqwest::Response, tokio::sync::SemaphorePermit<'a>),
+    Real(
+        reqwest::Response,
+        #[allow(unused)] tokio::sync::SemaphorePermit<'a>,
+    ),
     #[cfg(test)]
     Mock(Option<Bytes>),
 }
@@ -134,9 +137,19 @@ impl Network {
             // TODO: make this configurable on the CLI or something
             let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
             // TODO: make this configurable on the CLI or something
-            let client = Client::builder()
-                .user_agent(USER_AGENT)
-                .timeout(timeout)
+            let mut client_builder = Client::builder().user_agent(USER_AGENT).timeout(timeout);
+            if let Ok(cargo_config) = cargo_config2::Config::load() {
+                // Add the cargo `http.cainfo` to the reqwest client if it is set
+                if let Some(cainfo) = cargo_config.http.cainfo {
+                    match Network::parse_ca_file(&cainfo) {
+                        Ok(cert) => client_builder = client_builder.add_root_certificate(cert),
+                        Err(e) => println!(
+                            "failed to load certificate from Cargo http.cainfo `{}`, attempting to download without it. Error: {e:?}", cainfo
+                       ),
+                    }
+                }
+            }
+            let client = client_builder
                 .build()
                 .expect("Couldn't construct HTTP Client?");
             Some(Self {
@@ -147,6 +160,10 @@ impl Network {
                 mock_network: None,
             })
         }
+    }
+
+    fn parse_ca_file(path: &str) -> Result<reqwest::Certificate, Box<dyn std::error::Error>> {
+        Ok(reqwest::Certificate::from_pem(&std::fs::read(path)?)?)
     }
 
     /// Download a file and persist it to disk
@@ -241,7 +258,7 @@ impl Network {
 
     /// Internal core implementation of network fetching which is shared between
     /// `download` and `download_and_persist`.
-    async fn fetch_core(&self, url: Url) -> Result<Response, DownloadError> {
+    async fn fetch_core(&self, url: Url) -> Result<Response<'_>, DownloadError> {
         #[cfg(test)]
         if let Some(mock_network) = &self.mock_network {
             let chunk = mock_network
@@ -252,10 +269,9 @@ impl Network {
                     tracing::warn!("Attempt to fetch unsupported URL from mock network: {url}");
                     DownloadError::FailedToWriteDownload {
                         target: url.to_string().into(),
-                        error: std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("mock network does not support URL: {url}"),
-                        ),
+                        error: std::io::Error::other(format!(
+                            "mock network does not support URL: {url}"
+                        )),
                     }
                 })?;
             return Ok(Response::Mock(Some(chunk)));

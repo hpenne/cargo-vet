@@ -15,19 +15,21 @@ use errors::{
     AggregateCriteriaImplies, AggregateError, AggregateErrors, AggregateImpliesMismatchError,
     AuditAsError, AuditAsErrors, CacheAcquireError, CertifyError, CratePolicyError,
     CratePolicyErrors, FetchAuditError, LoadTomlError, NeedsAuditAsErrors,
-    NeedsPolicyVersionErrors, PackageError, ShouldntBeAuditAsErrors, TomlParseError,
-    UnusedAuditAsErrors, UnusedPolicyVersionErrors, UserInfoError,
+    NeedsPolicyVersionErrors, PackageError, ShouldntBeAuditAsErrors, UnusedAuditAsErrors,
+    UnusedPolicyVersionErrors, UserInfoError,
 };
 use format::{CriteriaName, CriteriaStr, PackageName, Policy, PolicyEntry, SortedSet, VetVersion};
 use futures_util::future::{join_all, try_join_all};
 use indicatif::ProgressDrawTarget;
 use lazy_static::lazy_static;
-use miette::{miette, Context, Diagnostic, IntoDiagnostic, SourceOffset};
+use miette::{miette, Context, Diagnostic, IntoDiagnostic};
 use network::Network;
 use out::{progress_bar, IncProgressOnDrop};
 use reqwest::Url;
+use resolver::AuditGraph;
 use serde::de::Deserialize;
 use serialization::spanned::Spanned;
+use serialization::Tidyable;
 use storage::fetch_registry;
 use thiserror::Error;
 use tracing::{error, info, trace, warn};
@@ -38,9 +40,9 @@ use crate::errors::{
     CommandError, DownloadError, FetchAndDiffError, FetchError, MetadataAcquireError, SourceFile,
 };
 use crate::format::{
-    AuditEntry, AuditKind, AuditsFile, ConfigFile, CratesUserId, CriteriaEntry, ExemptedDependency,
-    FetchCommand, MetaConfig, MetaConfigInstance, PackageStr, SortedMap, StoreInfo, TrustEntry,
-    WildcardEntry,
+    AuditEntry, AuditKind, AuditsFile, ConfigFile, CratesPublisherSource, CratesSourceId,
+    CriteriaEntry, ExemptedDependency, FetchCommand, MetaConfig, MetaConfigInstance, PackageStr,
+    SortedMap, StoreInfo, TrustEntry, WildcardEntry,
 };
 use crate::git_tool::Pager;
 use crate::out::{indeterminate_spinner, Out, StderrLogWriter, MULTIPROGRESS};
@@ -154,6 +156,8 @@ const DURATION_DAY: Duration = Duration::from_secs(60 * 60 * 24);
 
 lazy_static! {
     static ref WILDCARD_AUDIT_EXPIRATION_DURATION: chrono::Duration = chrono::Duration::weeks(6);
+    static ref WILDCARD_AUDIT_INACTIVE_CRATE_DURATION: chrono::Duration =
+        chrono::Duration::weeks(16);
 }
 /// This string is always used in a context such as "in the next {STR}".
 const WILDCARD_AUDIT_EXPIRATION_STRING: &str = "six weeks";
@@ -513,6 +517,7 @@ fn real_main() -> Result<(), miette::Report> {
         Some(Fmt(sub_args)) => cmd_fmt(&out, &cfg, sub_args),
         Some(Prune(sub_args)) => cmd_prune(&out, &cfg, sub_args),
         Some(DumpGraph(sub_args)) => cmd_dump_graph(&out, &cfg, sub_args),
+        Some(ExplainAudit(sub_args)) => cmd_explain_audit(&out, &cfg, sub_args),
         Some(Inspect(sub_args)) => cmd_inspect(&out, &cfg, sub_args),
         Some(Diff(sub_args)) => cmd_diff(&out, &cfg, sub_args),
         Some(Regenerate(Imports(sub_args))) => cmd_regenerate_imports(&out, &cfg, sub_args),
@@ -569,8 +574,20 @@ fn cmd_inspect(
             version: version.clone(),
         });
 
-        if sub_args.mode == FetchMode::Sourcegraph && version.git_rev.is_none() {
-            let url = format!("https://sourcegraph.com/crates/{package}@v{version}");
+        // Determine the fetch mode to use. We'll need to do a local diff if the
+        // selected version has a git revision.
+        let mode = cache.select_fetch_mode(sub_args.mode, version.git_rev.is_some());
+
+        if mode != FetchMode::Local {
+            let url = match mode {
+                FetchMode::Sourcegraph => {
+                    format!("https://sourcegraph.com/crates/{package}@v{version}")
+                }
+                FetchMode::DiffRs => {
+                    format!("https://diff.rs/browse/{package}/{version}/")
+                }
+                FetchMode::Local => unreachable!(),
+            };
             tokio::runtime::Handle::current()
                 .block_on(prompt_criteria_eulas(
                     out,
@@ -691,7 +708,7 @@ fn do_cmd_certify(
 
     // FIXME: can/should we check if the version makes sense..?
     if !sub_args.force
-        && !foreign_packages(&cfg.metadata, &store.config).any(|pkg| pkg.name == *package)
+        && !foreign_packages(&cfg.metadata, &store.config).any(|pkg| *pkg.name == *package)
     {
         return Err(CertifyError::NotAPackage(package));
     }
@@ -706,24 +723,23 @@ fn do_cmd_certify(
             version: VetVersion,
         },
         Wildcard {
-            user_login: String,
-            user_id: CratesUserId,
+            source: CratesPublisherSource,
             start: chrono::NaiveDate,
             end: chrono::NaiveDate,
             set_renew_false: bool,
         },
     }
 
-    let kind = if let Some(login) = &sub_args.wildcard {
+    let kind = if let Some(identifier) = &sub_args.wildcard {
         // Fetch publisher information for relevant versions of `package`.
         let publishers = store.ensure_publisher_versions(cfg, network, &package)?;
         let published_versions = publishers
             .iter()
-            .filter(|publisher| &publisher.user_login == login);
+            .filter(|publisher| publisher.source.as_identifier() == identifier);
 
-        let earliest = published_versions
-            .min_by_key(|p| p.when)
-            .ok_or_else(|| CertifyError::NotAPublisher(login.to_owned(), package.to_owned()))?;
+        let earliest = published_versions.min_by_key(|p| p.when).ok_or_else(|| {
+            CertifyError::NotAPublisher(identifier.to_owned(), package.to_owned())
+        })?;
 
         // Get the from and to dates, defaulting to a from date of the earliest
         // published package by the user, and a to date of 12 months from today.
@@ -737,8 +753,7 @@ fn do_cmd_certify(
         }
 
         CertifyKind::Wildcard {
-            user_login: earliest.user_login.to_owned(),
-            user_id: earliest.user_id,
+            source: earliest.source.clone(),
             start,
             end,
             set_renew_false,
@@ -837,13 +852,11 @@ fn do_cmd_certify(
                 )
         }
         CertifyKind::Wildcard {
-            user_login,
-            start,
-            end,
-            ..
+            source, start, end, ..
         } => {
+            let identifier = source.as_identifier();
             format!(
-                    "I, {username}, certify that any version of {package} published by '{user_login}' between {start} and {end} will satisfy the above criteria.",
+                    "I, {username}, certify that any version of {package} published by '{identifier}' between {start} and {end} will satisfy the above criteria.",
                 )
         }
     };
@@ -1021,7 +1034,7 @@ fn do_cmd_certify(
                 .push(entry);
         }
         CertifyKind::Wildcard {
-            user_id,
+            source,
             start,
             end,
             set_renew_false,
@@ -1035,7 +1048,7 @@ fn do_cmd_certify(
                 .push(WildcardEntry {
                     who,
                     criteria,
-                    user_id,
+                    source: source.as_wildcard_source(),
                     start: start.into(),
                     end: end.into(),
                     renew: set_renew_false.then_some(false),
@@ -1342,14 +1355,14 @@ fn do_cmd_trust(
         // Fetch publisher information for relevant versions of `package`.
         let publishers = store.ensure_publisher_versions(cfg, network, package)?;
 
-        let publisher_login = if let Some(login) = &sub_args.publisher_login {
+        let publisher_identifier = if let Some(login) = &sub_args.publisher_identifier {
             login.clone()
         } else if let Some(first) = publishers.first() {
             if publishers
                 .iter()
-                .all(|publisher| publisher.user_id == first.user_id)
+                .all(|publisher| publisher.source == first.source)
             {
-                first.user_login.clone()
+                first.source.as_identifier().to_owned()
             } else {
                 return Err(miette!(
                     "The package '{}' has multiple known publishers, \
@@ -1370,13 +1383,13 @@ fn do_cmd_trust(
             store,
             network,
             package,
-            &publisher_login,
+            &publisher_identifier,
             sub_args.start_date,
             sub_args.end_date,
             &sub_args.criteria,
             sub_args.notes.as_ref(),
         )
-    } else if let Some(publisher_login) = &sub_args.all {
+    } else if let Some(publisher_identifier) = &sub_args.all {
         // Run the resolver against the store in "suggest" mode to discover the
         // set of packages which either fail to audit or need exemptions.
         let suggest_store = store.clone_for_suggest(true);
@@ -1401,7 +1414,7 @@ fn do_cmd_trust(
             let publishers = store.ensure_publisher_versions(cfg, network, package.name)?;
             let by_user = publishers
                 .iter()
-                .filter(|p| &p.user_login == publisher_login)
+                .filter(|p| p.source.as_identifier() == publisher_identifier)
                 .count();
             if by_user == 0 {
                 continue; // never published by this user
@@ -1435,7 +1448,7 @@ fn do_cmd_trust(
         if trust.is_empty() {
             maybe_warn_skipped();
             return Err(miette!(
-                "No failing or exempted packages published by {publisher_login}"
+                "No failing or exempted packages published by {publisher_identifier}"
             ));
         }
 
@@ -1453,7 +1466,7 @@ fn do_cmd_trust(
             },
             if sub_args.criteria.is_empty() {
                 Some(format!(
-                    "choose trusted criteria for packages published by {publisher_login} ({})",
+                    "choose trusted criteria for packages published by {publisher_identifier} ({})",
                     string_format::FormatShortList::new(trust.clone())
                 ))
             } else {
@@ -1471,7 +1484,7 @@ fn do_cmd_trust(
                 store,
                 network,
                 package,
-                publisher_login,
+                publisher_identifier,
                 sub_args.start_date,
                 sub_args.end_date,
                 &criteria_names,
@@ -1492,7 +1505,7 @@ fn apply_cmd_trust(
     store: &mut Store,
     network: Option<&Network>,
     package: &str,
-    publisher_login: &str,
+    publisher_identifier: &str,
     start_date: Option<chrono::NaiveDate>,
     end_date: Option<chrono::NaiveDate>,
     criteria: &[CriteriaName],
@@ -1503,12 +1516,12 @@ fn apply_cmd_trust(
 
     let published_versions = publishers
         .iter()
-        .filter(|publisher| publisher.user_login == publisher_login);
+        .filter(|publisher| publisher.source.as_identifier() == publisher_identifier);
 
     let earliest = published_versions.min_by_key(|p| p.when).ok_or_else(|| {
-        CertifyError::NotAPublisher(publisher_login.to_owned(), package.to_owned())
+        CertifyError::NotAPublisher(publisher_identifier.to_owned(), package.to_owned())
     })?;
-    let user_id = earliest.user_id;
+    let source = earliest.source.as_wildcard_source();
 
     // Get the from and to dates, defaulting to a from date of the earliest
     // published package by the user, and a to date of 12 months from today.
@@ -1526,7 +1539,7 @@ fn apply_cmd_trust(
         },
         if criteria.is_empty() {
             Some(format!(
-                "choose trusted criteria for {package}:* published by {publisher_login}"
+                "choose trusted criteria for {package}:* published by {publisher_identifier}"
             ))
         } else {
             None
@@ -1540,7 +1553,7 @@ fn apply_cmd_trust(
     let trust_entries = store.audits.trusted.entry(package.to_owned()).or_default();
     if let Some(trust_entry) = trust_entries.iter_mut().find(|trust_entry| {
         trust_entry.criteria == criteria
-            && trust_entry.user_id == user_id
+            && trust_entry.source == source
             && start <= *trust_entry.start
             && *trust_entry.end <= end
             && notes.is_none()
@@ -1550,7 +1563,7 @@ fn apply_cmd_trust(
     } else {
         trust_entries.push(TrustEntry {
             criteria,
-            user_id,
+            source,
             start: start.into(),
             end: end.into(),
             notes: notes.cloned(),
@@ -1621,7 +1634,7 @@ fn cmd_record_violation(
 
     // FIXME: can/should we check if the version makes sense..?
     if !sub_args.force
-        && !foreign_packages(&cfg.metadata, &store.config).any(|pkg| pkg.name == sub_args.package)
+        && !foreign_packages(&cfg.metadata, &store.config).any(|pkg| *pkg.name == sub_args.package)
     {
         // ERRORS: immediate fatal diagnostic? should we allow you to forbid random packages?
         // You're definitely *allowed* to have unused audits, otherwise you'd be constantly deleting
@@ -1683,7 +1696,7 @@ fn cmd_add_exemption(
 
     // FIXME: can/should we check if the version makes sense..?
     if !sub_args.force
-        && !foreign_packages(&cfg.metadata, &store.config).any(|pkg| pkg.name == sub_args.package)
+        && !foreign_packages(&cfg.metadata, &store.config).any(|pkg| *pkg.name == sub_args.package)
     {
         // ERRORS: immediate fatal diagnostic? should we allow you to certify random packages?
         // You're definitely *allowed* to have unused audits, otherwise you'd be constantly deleting
@@ -1833,7 +1846,8 @@ fn cmd_regenerate_unpublished(
 
 fn cmd_renew(out: &Arc<dyn Out>, cfg: &Config, sub_args: &RenewArgs) -> Result<(), miette::Report> {
     trace!("renewing wildcard audits");
-    let mut store = Store::acquire_offline(cfg)?;
+    let network = Network::acquire(cfg);
+    let mut store = Store::acquire(cfg, network.as_ref(), false)?;
     do_cmd_renew(out, cfg, &mut store, sub_args);
     store.commit()?;
     Ok(())
@@ -1867,7 +1881,7 @@ fn do_cmd_renew(out: &Arc<dyn Out>, cfg: &Config, store: &mut Store, sub_args: &
     } else {
         // Find and update all expiring crates.
         assert!(sub_args.expiring);
-        renewing = WildcardAuditRenewal::expiring(cfg, store);
+        renewing = WildcardAuditRenewal::expiring(cfg, store, !sub_args.include_inactive);
 
         if renewing.is_empty() {
             info!("no wildcard audits that are eligible for renewal have expired or are expiring in the next {WILDCARD_AUDIT_EXPIRATION_STRING}");
@@ -1882,12 +1896,15 @@ fn do_cmd_renew(out: &Arc<dyn Out>, cfg: &Config, store: &mut Store, sub_args: &
         "Updated wildcard audits for the following crates and publishers to expire on {new_end_date}:"
     );
 
-    let user_string = |user_id: u64| -> String {
-        cache
-            .as_ref()
-            .and_then(|c| c.get_crates_user_info(user_id))
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| format!("id={}", user_id))
+    let user_string = |source: &CratesSourceId| -> String {
+        match source {
+            CratesSourceId::User { user_id } => cache
+                .as_ref()
+                .and_then(|c| c.get_crates_user_info(*user_id))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("id={}", user_id)),
+            CratesSourceId::TrustedPublisher { trusted_publisher } => trusted_publisher.clone(),
+        }
     };
     for (name, entries) in renewing.crates {
         writeln!(
@@ -1897,7 +1914,7 @@ fn do_cmd_renew(out: &Arc<dyn Out>, cfg: &Config, store: &mut Store, sub_args: &
             string_format::FormatShortList::new(
                 entries
                     .iter()
-                    .map(|(entry, _)| user_string(entry.user_id))
+                    .map(|(entry, _)| user_string(&entry.source))
                     .collect()
             )
         );
@@ -1918,7 +1935,7 @@ async fn fix_audit_as(
     let mut cache = Cache::acquire(cfg, network)?;
 
     let third_party_packages = foreign_packages_strict(&cfg.metadata, &store.config)
-        .map(|p| &p.name)
+        .map(|p| &*p.name)
         .collect::<SortedSet<_>>();
 
     let issues = check_audit_as_crates_io(cfg, store, network, &mut cache).await;
@@ -1934,7 +1951,7 @@ async fn fix_audit_as(
                 cfg.metadata
                     .packages
                     .iter()
-                    .filter(|&p| (p.name == error.package))
+                    .filter(|&p| *p.name == error.package)
                     .map(|p| p.vet_version())
                     .collect()
             };
@@ -1962,26 +1979,23 @@ async fn fix_audit_as(
                         // false positives, but is certainly a bit of a loose
                         // comparison. If it turns out to be an issue we can
                         // improve it in the future.
-                        let default_audit_as = if network.is_some() {
-                            // NOTE: Handle all errors silently here, as we can always recover by
-                            // setting `audit-as-crates-io = false`. The error cases below are very
-                            // unlikely to occur since information will be cached from the initial
-                            // checks which generated the NeedsAuditAsErrors.
-                            let crates_api_metadata =
-                                match cache.get_crate_metadata(network, &err.package).await {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        warn!("crate metadata error for {}: {e}", &err.package);
-                                        Default::default()
-                                    }
-                                };
-
-                            cfg.metadata.packages.iter().any(|p| {
-                                p.name == err.package && crates_api_metadata.consider_as_same(p)
-                            })
-                        } else {
-                            false
-                        };
+                        //
+                        // NOTE: Handle all errors silently here, as we can
+                        // always recover by setting `audit-as-crates-io =
+                        // false`. The error cases below are very unlikely to
+                        // occur since information will be cached from the
+                        // initial checks which generated the
+                        // NeedsAuditAsErrors.
+                        let default_audit_as =
+                            match cache.crates_io_info(network, &err.package).await {
+                                Ok(entry) => cfg.metadata.packages.iter().any(|p| {
+                                    *p.name == err.package && entry.metadata.consider_as_same(p)
+                                }),
+                                Err(e) => {
+                                    warn!("crate metadata error for {}: {e}", &err.package);
+                                    false
+                                }
+                            };
 
                         get_policy_entry(store, cfg, &third_party_packages, &err)
                             .audit_as_crates_io = Some(default_audit_as);
@@ -2052,13 +2066,25 @@ fn cmd_diff(out: &Arc<dyn Out>, cfg: &Config, sub_args: &DiffArgs) -> Result<(),
             version2: version2.clone(),
         });
 
-        if sub_args.mode == FetchMode::Sourcegraph
-            && version1.git_rev.is_none()
-            && version2.git_rev.is_none()
-        {
-            let url = format!(
-                "https://sourcegraph.com/crates/{package}/-/compare/v{version1}...v{version2}?visible=7000"
-            );
+        // Determine the fetch mode to use. We'll need to do a local diff if the
+        // selected version has a git revision.
+        let mode = cache.select_fetch_mode(
+            sub_args.mode,
+            version1.git_rev.is_some() || version2.git_rev.is_some(),
+        );
+
+        if mode != FetchMode::Local {
+            let url = match mode {
+                FetchMode::Sourcegraph => {
+                    format!(
+                        "https://sourcegraph.com/crates/{package}/-/compare/v{version1}...v{version2}?visible=7000"
+                    )
+                }
+                FetchMode::DiffRs => {
+                    format!("https://diff.rs/{package}/{version1}/{version2}/")
+                }
+                FetchMode::Local => unreachable!(),
+            };
             tokio::runtime::Handle::current()
                 .block_on(prompt_criteria_eulas(
                     out,
@@ -2162,12 +2188,13 @@ fn cmd_check(
     let network = Network::acquire(cfg);
     let mut store = Store::acquire(cfg, network.as_ref(), false)?;
 
+    // Check crate policies prior to audit_as_crates_io because the suggestions of
+    // check_audit_as_crates_io will rely on the correct structure of crate policies.
+    check_crate_policies(cfg, &store)?;
+
     if !cfg.cli.locked {
         // Check if any of our first-parties are in the crates.io registry
         let mut cache = Cache::acquire(cfg, network.as_ref()).into_diagnostic()?;
-        // Check crate policies prior to audit_as_crates_io because the suggestions of
-        // check_audit_as_crates_io will rely on the correct structure of crate policies.
-        check_crate_policies(cfg, &store)?;
         tokio::runtime::Handle::current().block_on(check_audit_as_crates_io(
             cfg,
             &store,
@@ -2246,7 +2273,7 @@ fn cmd_check(
             }
 
             // Warn about wildcard audits which will be expiring soon or have expired.
-            let expiry = WildcardAuditRenewal::expiring(cfg, &mut store);
+            let expiry = WildcardAuditRenewal::expiring(cfg, &mut store, true);
 
             if !expiry.is_empty() {
                 let expired = expiry.expired_crates();
@@ -2283,17 +2310,42 @@ impl<'a> WildcardAuditRenewal<'a> {
     ///
     /// This function _does not_ modify the store, but since the mutable references to the entries
     /// are stored (for potential use by `renew`), it must take a mutable Store.
-    pub fn expiring(cfg: &Config, store: &'a mut Store) -> Self {
+    pub fn expiring(cfg: &Config, store: &'a mut Store, ignore_inactive: bool) -> Self {
         let expire_date = cfg.today() + *WILDCARD_AUDIT_EXPIRATION_DURATION;
 
         let mut crates: SortedMap<PackageStr<'a>, Vec<(&'a mut WildcardEntry, bool)>> =
             Default::default();
         for (name, audits) in store.audits.wildcard_audits.iter_mut() {
+            // Get the most recent publication time for this crate on crates.io,
+            // which will be used to avoid expiry warnings for inactive crates.
+            let last_publish_date = store
+                .live_imports
+                .as_ref()
+                .and_then(|imports| imports.publisher.get(name))
+                .map(|publishers| &publishers[..])
+                .unwrap_or(&[])
+                .iter()
+                .map(|p| p.when)
+                .max()
+                .unwrap_or(cfg.today());
+
             // Check whether there are any audits expiring by the expiration date. Of those
             // audits, check whether all of them are already expired (to change the warning
             // message to be more informative).
             for entry in audits.iter_mut().filter(|e| e.should_renew(expire_date)) {
                 let expired = entry.should_renew(cfg.today());
+
+                // If the crate has not been published since the wildcard audit
+                // expired, and the last published version by that user is over
+                // 4 months ago, we silence the expiring/expired renewal
+                // warning.
+                if ignore_inactive
+                    && last_publish_date < *entry.end
+                    && last_publish_date < cfg.today() - *WILDCARD_AUDIT_INACTIVE_CRATE_DURATION
+                {
+                    continue;
+                }
+
                 crates.entry(name).or_default().push((entry, expired));
             }
         }
@@ -2418,17 +2470,13 @@ fn cmd_aggregate(
             let url_string = url.to_string();
             let audit_bytes = network.download(url).await?;
             let audit_string = String::from_utf8(audit_bytes).map_err(LoadTomlError::from)?;
-            let audit_source = SourceFile::new(&url_string, audit_string.clone());
-            let audit_file: AuditsFile = toml::de::from_str(&audit_string)
-                .map_err(|error| {
-                    let (line, col) = error.line_col().unwrap_or((0, 0));
-                    TomlParseError {
-                        source_code: audit_source,
-                        span: SourceOffset::from_location(&audit_string, line + 1, col + 1),
-                        error,
-                    }
-                })
-                .map_err(LoadTomlError::from)?;
+            let audit_source = SourceFile::new(&url_string, audit_string);
+
+            // We use foreign audit file parsing when loading sources to
+            // aggregate, so that we catch and emit warnings when aggregation
+            // fails, and don't generate invalid aggregated audit files.
+            let audit_file =
+                storage::foreign_audit_source_to_local_warn(&url_string, audit_source)?;
             Ok::<_, FetchAuditError>((url_string, audit_file))
         })))
         .into_diagnostic()?;
@@ -2549,6 +2597,9 @@ fn do_aggregate_audits(sources: Vec<(String, AuditsFile)>) -> Result<AuditsFile,
                 }));
         }
     }
+
+    aggregate.tidy();
+
     if errors.is_empty() {
         Ok(aggregate)
     } else {
@@ -2575,6 +2626,192 @@ fn cmd_dump_graph(
     Ok(())
 }
 
+fn explain_write_edge(
+    out: &Arc<dyn Out>,
+    store: &Store,
+    package: PackageStr<'_>,
+    idx: usize,
+    edge: &resolver::DeltaEdgeOrigin,
+) {
+    fn format_who(who: &[Spanned<String>]) -> String {
+        if who.is_empty() {
+            "<unspecified>".to_owned()
+        } else {
+            string_format::FormatShortList::new(who.to_owned()).to_string()
+        }
+    }
+
+    fn format_freshness(is_fresh_import: bool) -> &'static str {
+        if is_fresh_import {
+            " (uncached)"
+        } else {
+            ""
+        }
+    }
+
+    use resolver::DeltaEdgeOrigin::*;
+    match *edge {
+        StoredLocalAudit { audit_index, .. } => {
+            let audit = &store.audits.audits[package][audit_index];
+            let who = format_who(&audit.who);
+            match &audit.kind {
+                AuditKind::Full { version } => {
+                    writeln!(out, "{idx}) [local] full audit for {version} by {who}");
+                }
+                AuditKind::Delta { from, to } => {
+                    writeln!(out, "{idx}) [local] delta audit for {from}->{to} by {who}");
+                }
+                _ => unreachable!(),
+            }
+        }
+        ImportedAudit {
+            import_index,
+            audit_index,
+        } => {
+            let (import_name, audits_file) =
+                store.imported_audits().iter().nth(import_index).unwrap();
+            let audit = &audits_file.audits[package][audit_index];
+            let freshness = format_freshness(audit.is_fresh_import);
+            let who = format_who(&audit.who);
+            match &audit.kind {
+                AuditKind::Full { version } => {
+                    writeln!(
+                        out,
+                        "{idx}) [{import_name}{freshness}] full audit for {version} by {who}"
+                    );
+                }
+                AuditKind::Delta { from, to } => {
+                    writeln!(
+                        out,
+                        "{idx}) [{import_name}{freshness}] delta audit for {from}->{to} by {who}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        WildcardAudit {
+            import_index,
+            audit_index,
+            publisher_index,
+        } => {
+            let (import_name, audits_file) = match import_index {
+                Some(import_index) => {
+                    let (import_name, audits_file) =
+                        store.imported_audits().iter().nth(import_index).unwrap();
+                    (&import_name[..], audits_file)
+                }
+                None => ("local", &store.audits),
+            };
+
+            let audit = &audits_file.wildcard_audits[package][audit_index];
+            let who = format_who(&audit.who);
+
+            let publisher = &store.publishers()[package][publisher_index];
+            let version = &publisher.version;
+            let identifier = publisher.source.as_identifier();
+            let freshness = format_freshness(audit.is_fresh_import || publisher.is_fresh_import);
+
+            writeln!(out, "{idx}) [{import_name}{freshness}] wildcard audit for {version} (published by: {identifier}) by {who}");
+        }
+        Trusted { publisher_index } => {
+            let publisher = &store.publishers()[package][publisher_index];
+            let version = &publisher.version;
+            let identifier = publisher.source.as_identifier();
+            let freshness = format_freshness(publisher.is_fresh_import);
+
+            writeln!(
+                out,
+                "{idx}) [local{freshness}] trusted entry for {version} (published by: {identifier})"
+            );
+        }
+        Exemption { exemption_index } => {
+            let exemption = &store.config.exemptions[package][exemption_index];
+            let version = &exemption.version;
+            writeln!(out, "{idx}) [local] exemption for {version}");
+        }
+        Unpublished { unpublished_index } => {
+            let unpublished = &store.unpublished()[package][unpublished_index];
+            let version = &unpublished.version;
+            let audited_as = &unpublished.audited_as;
+            let freshness = format_freshness(unpublished.is_fresh_import);
+
+            writeln!(
+                out,
+                "{idx}) [local{freshness}] auditing unpublished version {version} as {audited_as}"
+            );
+        }
+        FreshExemption { .. } => {
+            unreachable!("Should not observe FreshExemption edge with PreferExemptions mode")
+        }
+    }
+}
+
+fn do_cmd_explain_audit(
+    out: &Arc<dyn Out>,
+    store: &Store,
+    package: PackageStr<'_>,
+    version: &VetVersion,
+    criteria_name: CriteriaStr<'_>,
+) -> Result<(), miette::Report> {
+    let criteria_mapper = CriteriaMapper::new(&store.audits.criteria);
+    let audit_graph = AuditGraph::build(store, &criteria_mapper, package, None)
+        .map_err(|_| miette!("This package has violation conflicts"))?;
+
+    match audit_graph.search(
+        criteria_mapper.criteria_index(criteria_name),
+        version,
+        resolver::SearchMode::PreferExemptions,
+    ) {
+        Ok(path) => {
+            writeln!(
+                out,
+                "The package {package} {version} certifies for {criteria_name}"
+            );
+            for (idx, edge) in path.iter().rev().enumerate() {
+                explain_write_edge(out, store, package, idx + 1, edge);
+            }
+        }
+        Err(failure) => {
+            writeln!(
+                out,
+                "The package {package} {version} does not certify for {criteria_name}"
+            );
+            if failure.reachable_from_root.len() > 1 {
+                writeln!(out, "The following versions would certify:");
+                for version in failure.reachable_from_root.iter().flatten() {
+                    writeln!(out, " - {version}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_explain_audit(
+    out: &Arc<dyn Out>,
+    cfg: &Config,
+    sub_args: &ExplainAuditArgs,
+) -> Result<(), miette::Report> {
+    let network = Network::acquire(cfg);
+    let store = Store::acquire(cfg, network.as_ref(), false)?;
+
+    let version = if let Some(version) = &sub_args.version {
+        version.clone()
+    } else {
+        let matching_packages = cfg
+            .metadata
+            .packages
+            .iter()
+            .filter(|pkg| *pkg.name == sub_args.package)
+            .collect::<Vec<_>>();
+        miette::ensure!(matching_packages.len() == 1, "Ambiguous package version");
+        matching_packages[0].vet_version()
+    };
+
+    do_cmd_explain_audit(out, &store, &sub_args.package, &version, &sub_args.criteria)
+}
+
 fn cmd_fmt(_out: &Arc<dyn Out>, cfg: &Config, _sub_args: &FmtArgs) -> Result<(), miette::Report> {
     // Reformat all the files (just load and store them, formatting is implicit).
     trace!("formatting...");
@@ -2590,98 +2827,109 @@ fn cmd_help_md(
     _cfg: &PartialConfig,
     _sub_args: &HelpMarkdownArgs,
 ) -> Result<(), miette::Report> {
-    let app_name = "cargo-vet";
-    let pretty_app_name = "cargo vet";
-    // Make a new App to get the help message this time.
-
-    writeln!(out, "# {pretty_app_name} CLI manual");
+    writeln!(out, "# cargo vet CLI manual");
     writeln!(out);
     writeln!(
         out,
-        "> This manual can be regenerated with `{pretty_app_name} help-markdown`"
+        "> This manual can be regenerated with `cargo vet help-markdown`"
     );
     writeln!(out);
 
-    let mut fake_cli = FakeCli::command().term_width(0);
+    let mut fake_cli = FakeCli::command()
+        .term_width(0)
+        .disable_help_subcommand(true);
+    fake_cli.build();
+
     let full_command = fake_cli.get_subcommands_mut().next().unwrap();
-    full_command.build();
-    let mut todo = vec![full_command];
+    let mut todo = vec![("cargo vet".to_owned(), full_command)];
     let mut is_full_command = true;
 
-    while let Some(command) = todo.pop() {
+    while let Some((name, command)) = todo.pop() {
         let mut help_buf = Vec::new();
         command.write_long_help(&mut help_buf).unwrap();
         let help = String::from_utf8(help_buf).unwrap();
 
-        // First line is --version
-        let mut lines = help.lines();
-        let version_line = lines.next().unwrap();
-        let subcommand_name = command.get_name();
-
-        if is_full_command {
-            writeln!(out, "Version: `{version_line}`");
-            writeln!(out);
-        } else {
+        if !is_full_command {
             // Give subcommands some breathing room
             writeln!(out, "<br><br><br>");
-            writeln!(out, "## {pretty_app_name} {subcommand_name}");
         }
 
-        let mut in_subcommands_listing = false;
-        let mut in_usage = false;
-        let mut in_global_options = false;
-        for line in lines {
-            // Use a trailing colon to indicate a heading
-            if let Some(heading) = line.strip_suffix(':') {
-                if !line.starts_with(' ') {
-                    // SCREAMING headers are Main headings
-                    if heading.to_ascii_uppercase() == heading {
-                        in_subcommands_listing = heading == "SUBCOMMANDS";
-                        in_usage = heading == "USAGE";
-                        in_global_options = heading == "GLOBAL OPTIONS";
+        let name_anchor = name.replace(' ', "-");
+        writeln!(out, "## {name}");
 
-                        writeln!(out, "### {heading}");
+        enum Section {
+            None,
+            Usage,
+            Commands,
+            Arguments,
+            Options,
+            GlobalOptions,
+        }
+        let mut section = Section::None;
 
-                        if in_global_options && !is_full_command {
-                            writeln!(
-                                out,
-                                "This subcommand accepts all the [global options](#global-options)"
-                            );
-                        }
-                    } else {
-                        writeln!(out, "### {heading}");
+        for mut line in help.lines() {
+            if let Some((heading, rest)) = line.split_once(':') {
+                let new_section = match heading {
+                    "Usage" => Section::Usage,
+                    "Commands" => Section::Commands,
+                    "Arguments" => Section::Arguments,
+                    "Options" => Section::Options,
+                    "Global Options" => Section::GlobalOptions,
+                    _ => Section::None,
+                };
+                if !matches!(new_section, Section::None) {
+                    writeln!(out, "### {heading}");
+                    section = new_section;
+                    line = rest;
+                    if matches!(section, Section::GlobalOptions) && !is_full_command {
+                        writeln!(
+                            out,
+                            "This subcommand accepts all the [global options](#global-options)"
+                        );
+                        continue;
                     }
-                    continue;
                 }
             }
+            let line = line.trim();
 
-            if in_global_options && !is_full_command {
+            if matches!(section, Section::GlobalOptions) && !is_full_command {
                 // Skip global options for non-primary commands
                 continue;
             }
 
-            if in_subcommands_listing && !line.starts_with("     ") {
-                // subcommand names are list items
-                let own_subcommand_name = line.trim();
-                write!(
-                    out,
-                    "* [{own_subcommand_name}](#{app_name}-{own_subcommand_name}): "
-                );
-                continue;
+            if matches!(section, Section::Commands) {
+                if let Some((sub_name, description)) = line.trim().split_once(' ') {
+                    // subcommand names are list items
+                    let description = description.trim();
+                    writeln!(
+                        out,
+                        "* [{sub_name}](#{name_anchor}-{sub_name}): {description}"
+                    );
+                    continue;
+                }
             }
-            // The rest is indented, get rid of that
-            let line = line.trim();
 
             // Usage strings get wrapped in full code blocks
-            if in_usage && line.starts_with(pretty_app_name) {
+            if matches!(section, Section::Usage) && line.starts_with(&name) {
                 writeln!(out, "```");
                 writeln!(out, "{line}");
                 writeln!(out, "```");
                 continue;
             }
 
+            // option names are subheadings (note: ignore bullets)
+            if matches!(section, Section::Options | Section::GlobalOptions)
+                && line.starts_with('-')
+                && !line.starts_with("- ")
+            {
+                writeln!(out, "#### `{line}`");
+                continue;
+            }
+
             // argument names are subheadings
-            if line.starts_with('-') || line.starts_with('<') {
+            if matches!(section, Section::Arguments)
+                && (line.starts_with('<') || line.starts_with('['))
+            {
                 writeln!(out, "#### `{line}`");
                 continue;
             }
@@ -2704,6 +2952,7 @@ fn cmd_help_md(
             command
                 .get_subcommands_mut()
                 .filter(|cmd| !cmd.is_hide_set())
+                .map(|cmd| (format!("{} {}", name, cmd.get_name()), cmd))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev(),
@@ -2891,8 +3140,8 @@ async fn check_audit_as_crates_io(
 
         for package in &first_party_packages {
             // Remove both versioned and unversioned entries
-            unused_audit_as.remove(&(package.name.clone(), Some(package.vet_version())));
-            unused_audit_as.remove(&(package.name.clone(), None));
+            unused_audit_as.remove(&(package.name.to_string(), Some(package.vet_version())));
+            unused_audit_as.remove(&(package.name.to_string(), None));
         }
         if !unused_audit_as.is_empty() {
             errors.push(AuditAsError::UnusedAuditAs(UnusedAuditAsErrors {
@@ -2904,95 +3153,108 @@ async fn check_audit_as_crates_io(
         }
     }
 
-    // We should only check the audit-as-crates-io entries if we have a network, because we
-    // shouldn't make recommendations based on potentially stale information.
-    if network.is_some() {
-        let progress = progress_bar(
-            "Validating",
-            "audit-as-crates-io specifications",
-            first_party_packages.len() as u64,
-        );
+    let progress = progress_bar(
+        "Validating",
+        "audit-as-crates-io specifications",
+        first_party_packages.len() as u64,
+    );
 
-        enum CheckAction {
-            NeedAuditAs,
-            ShouldntBeAuditAs,
-        }
+    enum CheckAction {
+        NeedAuditAs,
+        ShouldntBeAuditAs,
+    }
 
-        let actions: Vec<_> = join_all(first_party_packages.into_iter().map(|package| {
-            let progress = &progress;
-            let cache = &cache;
-            async move {
-                let _inc_progress = IncProgressOnDrop(progress, 1);
+    let actions: Vec<_> = join_all(first_party_packages.into_iter().map(|package| {
+        let progress = &progress;
+        let cache = &cache;
+        async move {
+            let _inc_progress = IncProgressOnDrop(progress, 1);
 
-                let audit_policy = package
-                    .policy_entry(&store.config.policy)
-                    .and_then(|policy| policy.audit_as_crates_io);
-                if audit_policy == Some(false) {
-                    // They've explicitly said this is first-party so we don't care about what's in the
-                    // registry.
-                    return None;
-                }
-
-                // To avoid unnecessary metadata lookup, only do so for packages which exist in the
-                // index. The case which doesn't work with this logic is if someone is using a
-                // package before it has ever been published, and then later it is published (in
-                // which case a third-party change causes a warning to unexpectedly come up).
-                // However, this case is sufficiently unlikely that for now it's worth the initial
-                // lookup to avoid unnecessarily trying to fetch metadata for unpublished crates.
-                //
-                // The caching logic already does this for us as an optimization, but since we may
-                // need to look at the specific versions later, we fetch it anyway.
-                let mut matches_crates_io_package = false;
-                if let Ok(metadata) = cache.get_crate_metadata(network, &package.name).await {
-                    matches_crates_io_package = metadata.consider_as_same(package);
-                }
-
-                if matches_crates_io_package && audit_policy.is_none() {
-                    // We found a package that has similar metadata to one with the same name
-                    // on crates.io: having no policy is an error.
-                    return Some((CheckAction::NeedAuditAs, package));
-                }
-                if !matches_crates_io_package && audit_policy == Some(true) {
-                    return Some((CheckAction::ShouldntBeAuditAs, package));
-                }
-                None
+            let audit_policy = package
+                .policy_entry(&store.config.policy)
+                .and_then(|policy| policy.audit_as_crates_io);
+            if audit_policy == Some(false) {
+                // They've explicitly said this is first-party so we don't care about what's in the
+                // registry.
+                return None;
             }
-        }))
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
 
-        let mut needs_audit_as_entry = vec![];
-        let mut shouldnt_be_audit_as = vec![];
+            let package_name = package.name.as_str();
 
-        for (action, package) in actions {
-            match action {
-                CheckAction::NeedAuditAs => {
-                    needs_audit_as_entry.push(PackageError {
-                        package: package.name.clone(),
-                        version: Some(package.vet_version()),
-                    });
-                }
-                CheckAction::ShouldntBeAuditAs => {
-                    shouldnt_be_audit_as.push(PackageError {
-                        package: package.name.clone(),
-                        version: Some(package.vet_version()),
-                    });
-                }
+            // Check for existing audits for the crate, which imply that it exists on
+            // crates.io.
+            let has_existing_audits = || {
+                std::iter::once(&store.audits)
+                    .chain(store.imports.audits.values())
+                    .any(|audits_file| {
+                        audits_file.audits.contains_key(package_name)
+                            || audits_file.wildcard_audits.contains_key(package_name)
+                            || audits_file.trusted.contains_key(package_name)
+                    })
+                    || store.config.exemptions.contains_key(package_name)
+            };
+
+            let matches_crates_io_package = async {
+                cache
+                    .crates_io_info(network, &package.name)
+                    .await
+                    .is_ok_and(|entry| entry.metadata.consider_as_same(package))
+            };
+
+            // To do some validation when no network is available, we assume the crate is on
+            // crates.io if there are any audits for the crate name (to avoid the crate being
+            // missed when e.g. applying local patches).
+            let crate_is_on_crates_io = has_existing_audits() || matches_crates_io_package.await;
+
+            if crate_is_on_crates_io && audit_policy.is_none() {
+                // We found a package that has similar metadata to one with the same name on
+                // crates.io, or we have audits for this crate name: having no policy is an
+                // error.
+                return Some((CheckAction::NeedAuditAs, package));
+            }
+
+            // When a network is available (so that we know our information is not stale), if
+            // there is no known crate on crates.io, the policy should not be true.
+            if network.is_some() && !crate_is_on_crates_io && audit_policy == Some(true) {
+                return Some((CheckAction::ShouldntBeAuditAs, package));
+            }
+            None
+        }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut needs_audit_as_entry = vec![];
+    let mut shouldnt_be_audit_as = vec![];
+
+    for (action, package) in actions {
+        match action {
+            CheckAction::NeedAuditAs => {
+                needs_audit_as_entry.push(PackageError {
+                    package: package.name.to_string(),
+                    version: Some(package.vet_version()),
+                });
+            }
+            CheckAction::ShouldntBeAuditAs => {
+                shouldnt_be_audit_as.push(PackageError {
+                    package: package.name.to_string(),
+                    version: Some(package.vet_version()),
+                });
             }
         }
+    }
 
-        if !needs_audit_as_entry.is_empty() {
-            errors.push(AuditAsError::NeedsAuditAs(NeedsAuditAsErrors {
-                errors: needs_audit_as_entry,
-            }));
-        }
-        if !shouldnt_be_audit_as.is_empty() {
-            errors.push(AuditAsError::ShouldntBeAuditAs(ShouldntBeAuditAsErrors {
-                errors: shouldnt_be_audit_as,
-            }));
-        }
+    if !needs_audit_as_entry.is_empty() {
+        errors.push(AuditAsError::NeedsAuditAs(NeedsAuditAsErrors {
+            errors: needs_audit_as_entry,
+        }));
+    }
+    if !shouldnt_be_audit_as.is_empty() {
+        errors.push(AuditAsError::ShouldntBeAuditAs(ShouldntBeAuditAsErrors {
+            errors: shouldnt_be_audit_as,
+        }));
     }
 
     if !errors.is_empty() {
@@ -3038,19 +3300,19 @@ fn check_crate_policies(cfg: &Config, store: &Store) -> Result<(), CratePolicyEr
     let mut needs_policy_version_errors = Vec::new();
 
     for package in &cfg.metadata.packages {
-        policy_crates.remove(&package.name);
+        policy_crates.remove(&*package.name);
 
         let versioned_policy_exists =
-            versioned_policy_crates.remove(&(package.name.clone(), package.vet_version()));
+            versioned_policy_crates.remove(&(package.name.to_string(), package.vet_version()));
 
         // If a crate has at least one third-party package and some crate policy specifies a
         // `dependency-criteria`, a versioned policy for all used versions must exist.
         if third_party_packages.contains(&package.name)
-            && dependency_criteria_packages.contains(&package.name)
+            && dependency_criteria_packages.contains(&*package.name)
             && !versioned_policy_exists
         {
             needs_policy_version_errors.push(PackageError {
-                package: package.name.clone(),
+                package: package.name.to_string(),
                 version: Some(package.vet_version()),
             });
         }

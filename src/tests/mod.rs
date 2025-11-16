@@ -15,10 +15,11 @@ use serde_json::{json, Value};
 use crate::{
     format::{
         AuditEntry, AuditKind, AuditsFile, ConfigFile, CratesAPICrate, CratesAPICrateMetadata,
-        CratesAPIUser, CratesAPIVersion, CratesPublisher, CratesUserId, CriteriaEntry, CriteriaMap,
-        CriteriaName, CriteriaStr, ExemptedDependency, FastMap, ImportsFile, MetaConfig,
-        PackageName, PackagePolicyEntry, PackageStr, PolicyEntry, SortedMap, SortedSet, TrustEntry,
-        VersionReq, VetVersion, WildcardEntry, SAFE_TO_DEPLOY, SAFE_TO_RUN,
+        CratesAPITrustpubData, CratesAPIUser, CratesAPIVersion, CratesPublisher, CratesSourceId,
+        CratesUserId, CriteriaEntry, CriteriaMap, CriteriaName, CriteriaStr, ExemptedDependency,
+        FastMap, ImportsFile, MetaConfig, PackageName, PackagePolicyEntry, PackageStr, PolicyEntry,
+        SortedMap, SortedSet, TrustEntry, VersionReq, VetVersion, WildcardEntry, SAFE_TO_DEPLOY,
+        SAFE_TO_RUN,
     },
     git_tool::Editor,
     network::Network,
@@ -51,6 +52,7 @@ mod aggregate;
 mod audit_as_crates_io;
 mod certify;
 mod crate_policies;
+mod explain_audit;
 mod import;
 mod regenerate_unaudited;
 mod registry;
@@ -263,9 +265,9 @@ fn wildcard_audit(user_id: u64, criteria: CriteriaStr) -> WildcardEntry {
         who: vec![],
         notes: None,
         criteria: vec![criteria.to_string().into()],
-        user_id,
-        start: chrono::NaiveDate::from_ymd_opt(2022, 12, 1).unwrap().into(),
-        end: chrono::NaiveDate::from_ymd_opt(2023, 1, 1).unwrap().into(),
+        source: CratesSourceId::User { user_id },
+        start: mock_months_ago(1).date_naive().into(),
+        end: mock_today().into(),
         renew: None,
         aggregated_from: vec![],
         is_fresh_import: false,
@@ -280,9 +282,25 @@ fn wildcard_audit_m(
         who: vec![],
         notes: None,
         criteria: criteria.into_iter().map(|s| s.into().into()).collect(),
-        user_id,
-        start: chrono::NaiveDate::from_ymd_opt(2022, 12, 1).unwrap().into(),
-        end: chrono::NaiveDate::from_ymd_opt(2023, 1, 1).unwrap().into(),
+        source: CratesSourceId::User { user_id },
+        start: mock_months_ago(1).date_naive().into(),
+        end: mock_today().into(),
+        renew: None,
+        aggregated_from: vec![],
+        is_fresh_import: false,
+    }
+}
+
+fn wildcard_audit_trustpub(trustpub: &str, criteria: CriteriaStr) -> WildcardEntry {
+    WildcardEntry {
+        who: vec![],
+        notes: None,
+        criteria: vec![criteria.to_string().into()],
+        source: CratesSourceId::TrustedPublisher {
+            trusted_publisher: trustpub.to_owned(),
+        },
+        start: mock_months_ago(1).date_naive().into(),
+        end: mock_today().into(),
         renew: None,
         aggregated_from: vec![],
         is_fresh_import: false,
@@ -293,9 +311,9 @@ fn trusted_entry(user_id: u64, criteria: CriteriaStr) -> TrustEntry {
     TrustEntry {
         notes: None,
         criteria: vec![criteria.to_string().into()],
-        user_id,
-        start: chrono::NaiveDate::from_ymd_opt(2022, 12, 1).unwrap().into(),
-        end: chrono::NaiveDate::from_ymd_opt(2023, 1, 1).unwrap().into(),
+        source: CratesSourceId::User { user_id },
+        start: mock_months_ago(1).date_naive().into(),
+        end: mock_today().into(),
         aggregated_from: vec![],
     }
 }
@@ -303,10 +321,12 @@ fn trusted_entry(user_id: u64, criteria: CriteriaStr) -> TrustEntry {
 fn publisher_entry(version: VetVersion, user_id: u64) -> CratesPublisher {
     CratesPublisher {
         version,
-        when: chrono::NaiveDate::from_ymd_opt(2022, 12, 15).unwrap(),
-        user_id,
-        user_login: format!("user{user_id}"),
-        user_name: None,
+        when: mock_weeks_ago(2).date_naive(),
+        source: crate::format::CratesPublisherSource::User {
+            user_id,
+            user_login: format!("user{user_id}"),
+            user_name: None,
+        },
         is_fresh_import: false,
     }
 }
@@ -319,10 +339,23 @@ fn publisher_entry_named(
 ) -> CratesPublisher {
     CratesPublisher {
         version,
-        when: chrono::NaiveDate::from_ymd_opt(2022, 12, 15).unwrap(),
-        user_id,
-        user_login: login.to_owned(),
-        user_name: Some(name.to_owned()),
+        when: mock_weeks_ago(2).date_naive(),
+        source: crate::format::CratesPublisherSource::User {
+            user_id,
+            user_login: login.to_owned(),
+            user_name: Some(name.to_owned()),
+        },
+        is_fresh_import: false,
+    }
+}
+
+fn publisher_entry_trustpub(version: VetVersion, trustpub: &str) -> CratesPublisher {
+    CratesPublisher {
+        version,
+        when: mock_weeks_ago(2).date_naive(),
+        source: crate::format::CratesPublisherSource::TrustedPublisher {
+            trusted_publisher: trustpub.to_owned(),
+        },
         is_fresh_import: false,
     }
 }
@@ -937,7 +970,7 @@ fn init_files(
             for package in &metadata.packages {
                 if package.id == *pkgid {
                     config.policy.insert(
-                        package.name.clone(),
+                        package.name.to_string(),
                         PackagePolicyEntry::Unversioned(PolicyEntry {
                             audit_as_crates_io: None,
                             criteria: Some(vec![default_criteria.to_string().into()]),
@@ -1012,7 +1045,7 @@ fn files_full_audited(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFi
     for package in &metadata.packages {
         if package.is_third_party(&config.policy) {
             audited
-                .entry(package.name.clone())
+                .entry(package.name.to_string())
                 .or_default()
                 .push(full_audit(package.vet_version(), DEFAULT_CRIT));
         }
@@ -1041,7 +1074,7 @@ fn builtin_files_full_audited(metadata: &Metadata) -> (ConfigFile, AuditsFile, I
     for package in &metadata.packages {
         if package.is_third_party(&config.policy) {
             audited
-                .entry(package.name.clone())
+                .entry(package.name.to_string())
                 .or_default()
                 .push(full_audit(package.vet_version(), SAFE_TO_DEPLOY));
         }
@@ -1078,7 +1111,17 @@ fn mock_now() -> chrono::DateTime<chrono::Utc> {
     )
 }
 
-/// Returns a fixed datetime that should be considered `today`: 2023-01-01.
+/// Returns a fixed datetime that is `months` months ago relative to `mock_now()`
+fn mock_months_ago(months: u32) -> chrono::DateTime<chrono::Utc> {
+    mock_now() - chrono::Months::new(months)
+}
+
+/// Returns a fixed datetime that is `weeks` weeks ago relative to `mock_now()`
+fn mock_weeks_ago(weeks: i64) -> chrono::DateTime<chrono::Utc> {
+    mock_now() - chrono::Duration::weeks(weeks)
+}
+
+/// Returns a fixed date that should be considered `today`: 2023-01-01.
 ///
 /// This is derived from `mock_now()`.
 fn mock_today() -> chrono::NaiveDate {
@@ -1250,13 +1293,14 @@ fn diff_store_commits(old: &SortedMap<String, String>, new: &SortedMap<String, S
 struct MockRegistryVersion {
     version: semver::Version,
     published_by: Option<CratesUserId>,
+    trustpub: Option<CratesAPITrustpubData>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn reg_published_by(
     version: VetVersion,
     published_by: Option<CratesUserId>,
-    when: &str,
+    when: chrono::DateTime<chrono::Utc>,
 ) -> MockRegistryVersion {
     assert!(
         version.git_rev.is_none(),
@@ -1265,13 +1309,29 @@ fn reg_published_by(
     MockRegistryVersion {
         version: version.semver,
         published_by,
-        created_at: chrono::DateTime::from_utc(
-            chrono::NaiveDateTime::new(
-                when.parse::<chrono::NaiveDate>().unwrap(),
-                chrono::NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
-            ),
-            chrono::Utc,
-        ),
+        trustpub: None,
+        created_at: when,
+    }
+}
+
+fn reg_trustpub_by(
+    version: VetVersion,
+    trustpub: &str,
+    when: chrono::DateTime<chrono::Utc>,
+) -> MockRegistryVersion {
+    assert!(
+        version.git_rev.is_none(),
+        "cannot publish a git version to registry"
+    );
+    let (provider, repository) = trustpub.split_once(':').unwrap();
+    assert_eq!(provider, "github");
+    MockRegistryVersion {
+        version: version.semver,
+        published_by: None,
+        trustpub: Some(CratesAPITrustpubData::GitHub {
+            repository: repository.to_owned(),
+        }),
+        created_at: when,
     }
 }
 
@@ -1382,6 +1442,7 @@ impl MockRegistryBuilder {
                                     name: user.name.clone(),
                                 }
                             }),
+                            trustpub_data: v.trustpub.clone(),
                         })
                         .collect(),
                 },

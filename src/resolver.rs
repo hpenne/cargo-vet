@@ -54,11 +54,11 @@ use crate::cli::{DumpGraphArgs, GraphFilter, GraphFilterProperty, GraphFilterQue
 use crate::criteria::{CriteriaMapper, CriteriaSet};
 use crate::errors::SuggestError;
 use crate::format::{
-    self, AuditEntry, AuditKind, AuditsFile, CratesCacheUser, CratesPublisher, CriteriaName, Delta,
-    DiffStat, ExemptedDependency, FastMap, FastSet, ImportName, ImportsFile, JsonPackage,
-    JsonReport, JsonReportConclusion, JsonReportFailForVet, JsonReportFailForViolationConflict,
-    JsonReportSuccess, JsonSuggest, JsonSuggestItem, JsonVetFailure, PackageName, PackageStr,
-    Policy, UnpublishedEntry, VetVersion, WildcardEntry,
+    self, AuditEntry, AuditKind, AuditsFile, CratesPublisher, CratesPublisherSource,
+    CratesSourceId, CriteriaName, Delta, DiffStat, ExemptedDependency, FastMap, FastSet,
+    ImportName, ImportsFile, JsonPackage, JsonReport, JsonReportConclusion, JsonReportFailForVet,
+    JsonReportFailForViolationConflict, JsonReportSuccess, JsonSuggest, JsonSuggestItem,
+    JsonVetFailure, PackageName, PackageStr, Policy, UnpublishedEntry, VetVersion, WildcardEntry,
 };
 use crate::format::{SortedMap, SortedSet};
 use crate::network::Network;
@@ -143,7 +143,7 @@ pub struct Suggest {
 #[derive(Debug, Clone)]
 pub struct TrustHint {
     trusted_by: Vec<String>,
-    publisher: CratesCacheUser,
+    publisher: CratesPublisherSource,
     exact_version: bool,
 }
 
@@ -180,8 +180,11 @@ pub type PackageIdx = usize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageNode<'a> {
-    #[serde(skip_serializing_if = "pkgid_unstable")]
+    #[serde(skip)]
     /// The PackageId that cargo uses to uniquely identify this package
+    ///
+    /// This ID is not guaranteed to be stable across cargo versions, so is not
+    /// serialized into graph JSON.
     ///
     /// Prefer using a [`DepGraph`] and its memoized [`PackageIdx`]'s.
     pub package_id: &'a PackageId,
@@ -209,11 +212,6 @@ pub struct PackageNode<'a> {
     pub is_root: bool,
     /// Whether this package only shows up in dev (test/bench) builds
     pub is_dev_only: bool,
-}
-
-/// Don't serialize path package ids, not stable across systems
-fn pkgid_unstable(pkgid: &PackageId) -> bool {
-    pkgid.repr.contains("(path+file:/")
 }
 
 /// The dependency graph in a form we can use more easily.
@@ -449,9 +447,13 @@ impl<'a> DepGraph<'a> {
             });
         }
 
-        // Sort the nodes by package_id to make the graph more stable and to make
-        // anything sorted by package_idx to also be approximately sorted by name and version.
-        nodes.sort_by_key(|k| k.package_id);
+        // Sort the nodes by package name and version to make the graph as
+        // stable as possible.  We avoid sorting by the package_id if possible,
+        // as for some packages it may not be stable (e.g. file:///), and the
+        // package_id format can also vary between cargo versions.
+        nodes.sort_by(|a, b| {
+            (a.name, &a.version, &a.package_id).cmp(&(b.name, &b.version, &b.package_id))
+        });
 
         // Populate the interners based on the new ordering
         for (idx, node) in nodes.iter_mut().enumerate() {
@@ -1194,7 +1196,7 @@ impl<'a> AuditGraph<'a> {
         // do.
         for (publisher_index, publisher) in publishers.iter().enumerate() {
             for (_, import_index, audit_index, entry) in all_wildcard_audits.clone() {
-                if entry.user_id == publisher.user_id
+                if entry.source == publisher.source
                     && *entry.start <= publisher.when
                     && publisher.when < *entry.end
                 {
@@ -1225,7 +1227,7 @@ impl<'a> AuditGraph<'a> {
             }
 
             for entry in trusteds {
-                if entry.user_id == publisher.user_id
+                if entry.source == publisher.source
                     && *entry.start <= publisher.when
                     && publisher.when < *entry.end
                 {
@@ -1541,18 +1543,18 @@ fn search_for_path(
             }
         }
     }
-    impl<'a> PartialEq for Node<'a> {
+    impl PartialEq for Node<'_> {
         fn eq(&self, other: &Self) -> bool {
             self.key() == other.key()
         }
     }
-    impl<'a> Eq for Node<'a> {}
-    impl<'a> PartialOrd for Node<'a> {
+    impl Eq for Node<'_> {}
+    impl PartialOrd for Node<'_> {
         fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
             Some(self.cmp(other))
         }
     }
-    impl<'a> Ord for Node<'a> {
+    impl Ord for Node<'_> {
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
             self.key().cmp(&other.key())
         }
@@ -1663,7 +1665,7 @@ fn search_for_path(
     Err(visited.into_iter().map(|v| v.cloned()).collect())
 }
 
-impl<'a> ResolveReport<'a> {
+impl ResolveReport<'_> {
     pub fn has_errors(&self) -> bool {
         // Just check the conclusion
         !matches!(self.conclusion, Conclusion::Success(_))
@@ -1707,17 +1709,17 @@ impl<'a> ResolveReport<'a> {
 
         const THIS_PROJECT: &str = "this project";
 
-        let mut trusted_publishers: FastMap<u64, SortedSet<ImportName>> = FastMap::new();
+        let mut trusted_publishers: FastMap<CratesSourceId, SortedSet<ImportName>> = FastMap::new();
         for trusted_entry in store.audits.trusted.values().flatten() {
             trusted_publishers
-                .entry(trusted_entry.user_id)
+                .entry(trusted_entry.source.clone())
                 .or_default()
                 .insert(THIS_PROJECT.to_owned());
         }
         for (import_name, audits_file) in store.imported_audits() {
             for trusted_entry in audits_file.trusted.values().flatten() {
                 trusted_publishers
-                    .entry(trusted_entry.user_id)
+                    .entry(trusted_entry.source.clone())
                     .or_default()
                     .insert(import_name.clone());
             }
@@ -1766,30 +1768,20 @@ impl<'a> ResolveReport<'a> {
                     // Attempt to look up the publisher of the target version
                     // for the suggested diff, and also record whether the given
                     // package has a sole publisher.
-                    let mut is_sole_publisher = false;
-                    let publisher_id =
-                        if let (Some(network), None) = (&network, &suggested_diff.to.git_rev) {
-                            let versions = cache
-                                .get_publishers(
-                                    Some(network),
-                                    package.name,
-                                    [&suggested_diff.to.semver].into_iter().collect(),
-                                )
-                                .await
-                                .unwrap_or_default();
-                            let publisher_count = versions
-                                .iter()
-                                .flat_map(|(_, details)| &details.published_by)
-                                .collect::<FastSet<_>>()
-                                .len();
-                            is_sole_publisher = publisher_count == 1;
-                            versions
-                                .into_iter()
-                                .find(|(v, _)| v == &suggested_diff.to.semver)
-                                .and_then(|(_, d)| d.published_by)
-                        } else {
-                            None
-                        };
+                    let crates_io_info = cache.crates_io_info(network, package.name).await.ok();
+                    let publisher_source = match (suggested_diff.to.as_semver(), &crates_io_info) {
+                        (Some(semver), Some(metadata)) => metadata
+                            .versions
+                            .get(semver)
+                            .and_then(|details| details.source.as_ref()),
+                        _ => None,
+                    };
+                    let publisher_count = crates_io_info
+                        .iter()
+                        .flat_map(|m| m.versions.values())
+                        .flat_map(|details| &details.source)
+                        .collect::<FastSet<_>>()
+                        .len();
 
                     // Compute the trust hint, which is the information used to generate "consider
                     // cargo trust FOO" messages. There can be multiple potential hints, but we
@@ -1801,25 +1793,27 @@ impl<'a> ResolveReport<'a> {
                     // those we find, if any.
                     let trust_hint = {
                         let mut exact_version = false;
-                        let id_for_hint = if publisher_id
-                            .map_or(false, |i| trusted_publishers.contains_key(&i))
+                        let source_for_hint = if publisher_source
+                            .is_some_and(|i| trusted_publishers.contains_key(i))
                         {
                             exact_version = true;
-                            publisher_id
-                        } else if store.audits.trusted.get(package.name).is_none() {
-                            cache
-                                .get_cached_publishers(package.name)
-                                .iter()
-                                .rev()
-                                .filter_map(|(_, details)| details.published_by)
-                                .find(|i| trusted_publishers.contains_key(i))
+                            publisher_source
+                        } else if !store.audits.trusted.contains_key(package.name) {
+                            crates_io_info.as_ref().and_then(|metadata| {
+                                metadata
+                                    .versions
+                                    .iter()
+                                    .rev()
+                                    .filter_map(|(_, details)| details.source.as_ref())
+                                    .find(|i| trusted_publishers.contains_key(i))
+                            })
                         } else {
                             None
                         };
 
-                        id_for_hint.map(|id| {
+                        source_for_hint.map(|source| {
                             let mut trusted_by: Vec<String> = trusted_publishers
-                                .get(&id)
+                                .get(source)
                                 .unwrap()
                                 .iter()
                                 .cloned()
@@ -1829,7 +1823,7 @@ impl<'a> ResolveReport<'a> {
                             if trusted_by.iter().any(|s| s == THIS_PROJECT) {
                                 trusted_by.retain(|s| s == THIS_PROJECT);
                             }
-                            let publisher = cache.get_crates_user_info(id).unwrap();
+                            let publisher = cache.publisher_id_to_source(source).unwrap();
                             TrustHint {
                                 trusted_by,
                                 publisher,
@@ -1838,9 +1832,10 @@ impl<'a> ResolveReport<'a> {
                         })
                     };
 
-                    let publisher_login = publisher_id
-                        .and_then(|user_id| cache.get_crates_user_info(user_id))
-                        .map(|pi| pi.login);
+                    let publisher_login = publisher_source
+                        .as_ref()
+                        .and_then(|source| cache.publisher_id_to_source(source))
+                        .map(|pi| pi.as_identifier().to_owned());
 
                     let mut registry_suggestion: Vec<_> = join_all(registry.iter().flatten().map(
                         |(name, entry, audits)| async {
@@ -1928,7 +1923,7 @@ impl<'a> ResolveReport<'a> {
                             notable_parents: notable_parents.clone(),
                             publisher_login,
                             trust_hint,
-                            is_sole_publisher,
+                            is_sole_publisher: publisher_count == 1,
                             registry_suggestion,
                         }])
                         .collect()
@@ -1977,9 +1972,26 @@ impl<'a> ResolveReport<'a> {
 
         let mut suggestions_by_criteria = SortedMap::<CriteriaName, Vec<SuggestItem>>::new();
         for s in suggestions.clone().into_iter() {
+            // Generate a suggestion for which criteria to use for the given
+            // suggestion. For each criteria, also list out others which would
+            // imply the required criteria to surface the full set of options.
             let criteria_names = self
                 .criteria_mapper
-                .criteria_names(&s.suggested_criteria)
+                .minimal_indices(&s.suggested_criteria)
+                .map(|criteria_idx| {
+                    let name = self.criteria_mapper.criteria_name(criteria_idx);
+                    let implied_by = self
+                        .criteria_mapper
+                        .implied_by_indices(criteria_idx)
+                        .map(|idx| format!("or {}", self.criteria_mapper.criteria_name(idx)))
+                        .collect::<Vec<_>>();
+
+                    if implied_by.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{} ({})", name, implied_by.join(", "))
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
 
@@ -2345,7 +2357,7 @@ impl Suggest {
                     } else {
                         ""
                     };
-                    let publisher = hint.publisher.clone();
+                    let publisher = &hint.publisher;
                     let trusted_by = FormatShortList::new(hint.trusted_by.clone());
                     writeln!(
                         out,
@@ -2355,7 +2367,8 @@ impl Suggest {
                         )),
                         if item.is_sole_publisher {
                             let this_cmd = format!("cargo vet trust {}", package.name);
-                            let all_cmd = format!("cargo vet trust --all {}", publisher.login);
+                            let all_cmd =
+                                format!("cargo vet trust --all {}", publisher.as_identifier());
                             format!(
                                 "{} {} {}",
                                 dim.clone().cyan().apply_to(this_cmd),
@@ -2363,8 +2376,11 @@ impl Suggest {
                                 dim.clone().cyan().apply_to(all_cmd),
                             )
                         } else {
-                            let cmd =
-                                format!("cargo vet trust {} {}", package.name, publisher.login);
+                            let cmd = format!(
+                                "cargo vet trust {} {}",
+                                package.name,
+                                publisher.as_identifier()
+                            );
                             dim.clone().cyan().apply_to(cmd).to_string()
                         }
                     );
@@ -2536,7 +2552,11 @@ async fn suggest_delta(
 ) -> Option<(DiffRecommendation, Option<DiffRecommendation>)> {
     // Fetch the set of known versions from crates.io so we know which versions
     // we'll have sources for.
-    let known_versions = cache.get_versions(network, package_name).await.ok();
+    let known_versions = if let Some(network) = network {
+        cache.published_versions(network, package_name).await.ok()
+    } else {
+        None
+    };
 
     // Collect up the details of how we failed
     struct Reachable<'a> {
@@ -2571,11 +2591,11 @@ async fn suggest_delta(
                 }
                 // We have sources if the version has been published to crates.io.
                 //
-                // For testing fallbacks, assume we always have sources if the
-                // index is unavailable.
+                // For testing fallbacks or when we're offline, assume we always
+                // have sources if the index is unavailable.
                 known_versions
                     .as_ref()
-                    .map_or(true, |versions| versions.contains(&ver.semver))
+                    .is_none_or(|versions| versions.contains_key(&ver.semver))
             };
             reachable = Some(Reachable {
                 from_root: reachable_from_root
@@ -2621,7 +2641,7 @@ async fn suggest_delta(
         // encourage auditing first.
         let closest_below = if let Some(known_versions) = &known_versions {
             known_versions
-                .iter()
+                .keys()
                 .filter(|&v| v <= &package_version.semver)
                 .max()
         } else {
@@ -2839,6 +2859,39 @@ pub fn update_store(
     get_store_updates(cfg, store, mode).apply(store);
 }
 
+/// Helper function to determine if we should be pruning imports.
+///
+/// We always prune if requested, but will also prune imports if a new audit or
+/// publisher entry is being added for the crate.
+fn should_prune_imports(
+    store: &Store,
+    required_entries: &Option<SortedMap<RequiredEntry, CriteriaSet>>,
+    mode: UpdateMode,
+    pkgname: PackageStr<'_>,
+) -> bool {
+    if mode.prune_imports {
+        true
+    } else if let Some(required_entries) = required_entries {
+        let import = |idx| store.imported_audits().values().nth(idx).unwrap();
+        required_entries.keys().any(|entry| match entry {
+            RequiredEntry::Audit {
+                import_index,
+                audit_index,
+            } => import(*import_index).audits[pkgname][*audit_index].is_fresh_import,
+            RequiredEntry::WildcardAudit {
+                import_index,
+                audit_index,
+            } => import(*import_index).wildcard_audits[pkgname][*audit_index].is_fresh_import,
+            RequiredEntry::Publisher { publisher_index } => {
+                store.publishers()[pkgname][*publisher_index].is_fresh_import
+            }
+            _ => false,
+        })
+    } else {
+        false
+    }
+}
+
 /// The non-mutating core of `update_store` for use in non-mutating situations.
 pub(crate) fn get_store_updates(
     cfg: &Config,
@@ -2913,10 +2966,11 @@ pub(crate) fn get_store_updates(
                 .wildcard_audits
                 .iter()
                 .map(|(pkgname, wildcard_audits)| {
-                    let prune_imports = mode(&pkgname[..]).prune_imports;
                     let required_entries = required_entries
                         .get(&pkgname[..])
                         .unwrap_or(&no_required_entries);
+                    let prune_imports =
+                        should_prune_imports(store, required_entries, mode(&pkgname[..]), pkgname);
                     (
                         pkgname,
                         wildcard_audits
@@ -2955,12 +3009,13 @@ pub(crate) fn get_store_updates(
                 .audits
                 .iter()
                 .map(|(pkgname, audits)| {
-                    let prune_imports = mode(&pkgname[..]).prune_imports;
                     let (uses_package, required_entries) = match required_entries.get(&pkgname[..])
                     {
                         Some(e) => (true, e),
                         None => (false, &no_required_entries),
                     };
+                    let prune_imports =
+                        should_prune_imports(store, required_entries, mode(&pkgname[..]), pkgname);
                     (
                         pkgname,
                         audits
@@ -3010,10 +3065,11 @@ pub(crate) fn get_store_updates(
 
     // Determine which live publisher information to keep in the imports.lock file.
     for (pkgname, publishers) in store.publishers() {
-        let prune_imports = mode(&pkgname[..]).prune_imports;
         let required_entries = required_entries
             .get(&pkgname[..])
             .unwrap_or(&no_required_entries);
+        let prune_imports =
+            should_prune_imports(store, required_entries, mode(&pkgname[..]), pkgname);
         let mut publishers: Vec<_> = publishers
             .iter()
             .enumerate()
