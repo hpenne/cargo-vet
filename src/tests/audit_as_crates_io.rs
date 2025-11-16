@@ -59,7 +59,7 @@ fn get_audit_as_crates_io(cfg: &Config, store: &Store, add_packages_to_index: bo
 }
 
 fn get_audit_as_crates_io_no_network(cfg: &Config, store: &Store) -> String {
-    let mut cache = crate::storage::Cache::acquire(cfg).unwrap();
+    let mut cache = crate::storage::Cache::acquire(cfg, None).unwrap();
     let res = tokio::runtime::Handle::current().block_on(crate::check_audit_as_crates_io(
         cfg, store, None, &mut cache,
     ));

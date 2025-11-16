@@ -2363,7 +2363,7 @@ impl Cache {
                 // Crate names can only be a subset of ascii (valid rust
                 // identifier characters and `-`), so using `len()` and indexing
                 // will result in valid counts/characters.
-                let mut url = String::from("https://index.crates.io/");
+                let mut url = self.registry_urls.index.clone();
                 use std::fmt::Write;
                 match package.len() {
                     1 => write!(url, "1/{package}"),
@@ -2479,7 +2479,8 @@ impl Cache {
         once_cell
             .get_or_try_init(|| async {
                 info!("fetching crate metadata for crate {}", package);
-                let url = Url::parse(&format!("https://crates.io/api/v1/crates/{}", package))
+                let url = Url::parse(&format!("{}/{}",
+                self.registry_urls.api, package))
                     .expect("invalid crate name");
                 let response = network.download(url).await?;
                 let result = load_json::<CratesAPICrate>(&response[..])?;
