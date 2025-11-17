@@ -2478,8 +2478,7 @@ impl Cache {
         once_cell
             .get_or_try_init(|| async {
                 info!("fetching crate metadata for crate {}", package);
-                let url = Url::parse(&format!("{}/{}",
-                self.registry_urls.api, package))
+                let url = Url::parse(&format!("{}/{}", self.registry_urls.api, package))
                     .expect("invalid crate name");
                 let response = network.download(url).await?;
                 let result = load_json::<CratesAPICrate>(&response[..])?;
@@ -2901,13 +2900,13 @@ fn get_registry_for(
 }
 
 pub fn get_registry_url_from_config(cargo_config: &str) -> Result<Option<String>, RedirectError> {
-    return cargo_config
+    cargo_config
         .parse::<toml::Value>()?
         .as_table()
         .and_then(|t| t.get("source"))
         .and_then(|s| s.as_table())
         .and_then(|s| get_registry_for("crates-io", s, 5).transpose())
-        .transpose();
+        .transpose()
 }
 
 pub fn read_cargo_config_from_dir(dir: &Path) -> Option<String> {
