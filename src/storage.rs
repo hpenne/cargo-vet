@@ -1911,8 +1911,7 @@ impl Cache {
                         })?;
 
                         // We don't have it, so download it
-                        let url =
-                            format!("{}/{package}/{version}/download", self.registry_urls.api);
+                        let url = format!("{}/{package}/{version}/download", self.registry_urls.dl);
                         let url = Url::parse(&url).map_err(|error| FetchError::InvalidUrl {
                             url: url.clone(),
                             error,
@@ -2953,6 +2952,8 @@ pub struct RegistryUrls {
     index: String,
     // URL for the web API
     api: String,
+    // URL for crate downloads
+    dl: String,
 }
 
 pub fn get_registry_urls(network: Option<&Network>) -> Result<RegistryUrls, RedirectError> {
@@ -2972,13 +2973,13 @@ pub fn get_registry_urls(network: Option<&Network>) -> Result<RegistryUrls, Redi
                     .ok()
                     .and_then(|c| String::from_utf8(c).ok())
                 {
-                    // Parse the JSON and use the "api" field as the URL for the web API:
-                    if let Some(api) = serde_json::from_str(&config)
-                        .ok()
-                        .map(|v: Value| v["api"].clone())
-                        .map(|v| v.to_string())
-                    {
-                        return Ok(RegistryUrls { index, api });
+                    // Parse the JSON and find the two URLs for API and download:
+                    if let Ok(config) = serde_json::from_str::<Value>(&config) {
+                        if let Some(api) = config["api"].clone().as_str().map(|v| v.to_string()) {
+                            if let Some(dl) = config["dl"].clone().as_str().map(|v| v.to_string()) {
+                                return Ok(RegistryUrls { index, api, dl });
+                            }
+                        }
                     }
                 }
             }
@@ -2989,5 +2990,6 @@ pub fn get_registry_urls(network: Option<&Network>) -> Result<RegistryUrls, Redi
     Ok(RegistryUrls {
         index: "https://index.crates.io/".into(),
         api: "https://crates.io/api/v1/crates".into(),
+        dl: "https://crates.io/api/v1/crates".into(),
     })
 }

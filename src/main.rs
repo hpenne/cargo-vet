@@ -539,7 +539,8 @@ fn cmd_init(_out: &Arc<dyn Out>, cfg: &Config, _sub_args: &InitArgs) -> Result<(
     let mut store = Store::create(cfg)?;
 
     check_crate_policies(cfg, &store)?;
-    tokio::runtime::Handle::current().block_on(fix_audit_as(cfg, network.as_ref(), &mut store))?;
+    let mut cache = Cache::acquire(cfg, network.as_ref())?;
+    tokio::runtime::Handle::current().block_on(fix_audit_as(cfg, network.as_ref(), &mut cache, &mut store))?;
 
     // Run the resolver to regenerate exemptions, this will fill in exemptions
     // such that the vet now passes.
@@ -1793,7 +1794,8 @@ fn cmd_regenerate_audit_as(
     let network = Network::acquire(cfg);
     let mut store = Store::acquire_offline(cfg)?;
 
-    tokio::runtime::Handle::current().block_on(fix_audit_as(cfg, network.as_ref(), &mut store))?;
+    let mut cache = Cache::acquire(cfg, network.as_ref())?;
+    tokio::runtime::Handle::current().block_on(fix_audit_as(cfg, network.as_ref(), &mut cache, &mut store))?;
 
     // We were successful, commit the store
     store.commit()?;
@@ -1928,17 +1930,16 @@ fn do_cmd_renew(out: &Arc<dyn Out>, cfg: &Config, store: &mut Store, sub_args: &
 async fn fix_audit_as(
     cfg: &Config,
     network: Option<&Network>,
+    cache: &mut Cache,
     store: &mut Store,
 ) -> Result<(), CacheAcquireError> {
     let _spinner = indeterminate_spinner("Fetching", "crate metadata");
-
-    let mut cache = Cache::acquire(cfg, network)?;
 
     let third_party_packages = foreign_packages_strict(&cfg.metadata, &store.config)
         .map(|p| &*p.name)
         .collect::<SortedSet<_>>();
 
-    let issues = check_audit_as_crates_io(cfg, store, network, &mut cache).await;
+    let issues = check_audit_as_crates_io(cfg, store, network, cache).await;
     if let Err(AuditAsErrors { errors }) = issues {
         fn get_policy_entry<'a>(
             store: &'a mut Store,
