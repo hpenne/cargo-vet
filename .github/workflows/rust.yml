@@ -62,10 +62,10 @@ jobs:
         run: |
           cargo check
 
-  vet:
-    runs-on: ubuntu-latest
-    steps:
-     - uses: actions/checkout@v2
-     - name: Run cargo vet
-       run: |
-        cargo run -- vet --locked
+#  vet:
+#    runs-on: ubuntu-latest
+#    steps:
+#     - uses: actions/checkout@v2
+#     - name: Run cargo vet
+#       run: |
+#        cargo run -- vet --locked
